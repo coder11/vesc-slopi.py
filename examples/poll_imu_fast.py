@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Poll VESC IMU data over USB serial as fast as possible.
+"""Poll VESC IMU data over USB serial or direct BLE with minimal overhead.
 
 The regular VescClient API is easier to use, but it performs a firmware
 handshake, uses generic packet dispatch, and returns Pydantic models. This
@@ -17,9 +17,12 @@ phase estimates without firmware-side sample timestamps or sample indexes.
 Examples:
     uv run examples/poll_imu_fast.py
     uv run examples/poll_imu_fast.py --port /dev/ttyACM0 --duration 10
+    uv run examples/poll_imu_fast.py --ble AA:BB:CC:DD:EE:FF --duration 10
+    uv run examples/poll_imu_fast.py --can-id 1 --duration 10
     uv run examples/poll_imu_fast.py --fields rpy,acc,gyro --pipeline-depth 4
     uv run examples/poll_imu_fast.py --plot --plot-axis z --pipeline-depth 4
     uv run examples/poll_imu_fast.py --mask 0x01ff --csv > imu.csv
+    uv run examples/poll_imu_fast.py --scan-ble
 """
 
 from __future__ import annotations
@@ -40,7 +43,7 @@ from typing import TYPE_CHECKING, Any, Protocol, TextIO, cast
 
 import serial  # type: ignore[import-untyped]
 
-from vesc_py import list_serial_ports
+from vesc_py import ble_scan, list_serial_ports
 from vesc_py.client import Transport, VescClient
 from vesc_py.comm_ids import CommPacketId
 from vesc_py.config_schema import CfgType, ConfigParam, ConfigSchema
@@ -164,8 +167,8 @@ def import_numpy() -> Any:
     return numpy_module
 
 
-class SerialLike(Protocol):
-    """Small pyserial surface used by the fast poller."""
+class PollIo(Protocol):
+    """Small blocking byte-stream surface used by the fast poller."""
 
     timeout: float | None
 
@@ -176,6 +179,55 @@ class SerialLike(Protocol):
     def reset_input_buffer(self) -> None: ...
 
     def close(self) -> None: ...
+
+
+class BufferedTransportIO:
+    """Adapt a chunked ``Transport`` to the poller's blocking ``read(size)`` API."""
+
+    def __init__(self, transport: Transport) -> None:
+        self._transport = transport
+        self._buffer = bytearray()
+        self.timeout: float | None = None
+
+    def read(self, size: int = 1) -> bytes:
+        if size <= 0:
+            return b""
+
+        deadline: float | None = None
+        if self.timeout is not None:
+            deadline = time.monotonic() + self.timeout
+
+        while len(self._buffer) < size:
+            remaining: float
+            if deadline is None:
+                remaining = 1.0
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    break
+
+            chunk = self._transport.recv(remaining)
+            if not chunk:
+                break
+            self._buffer.extend(chunk)
+
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def write(self, data: bytes) -> int:
+        self._transport.send(data)
+        return len(data)
+
+    def reset_input_buffer(self) -> None:
+        self._buffer.clear()
+        while True:
+            chunk = self._transport.recv(0.0)
+            if not chunk:
+                return
+
+    def close(self) -> None:
+        self._transport.close()
 
 
 @dataclass(slots=True)
@@ -461,7 +513,7 @@ def parse_imu_payload(payload: bytes) -> ParsedImu:
     return ParsedImu(mask=mask, values=tuple(values), vesc_id=vesc_id)
 
 
-def build_imu_request(mask: int) -> bytes:
+def build_imu_request(mask: int, can_id: int | None = None) -> bytes:
     """Build a fully framed COMM_GET_IMU_DATA request once for reuse."""
     payload = bytes(
         (
@@ -470,10 +522,14 @@ def build_imu_request(mask: int) -> bytes:
             mask & 0xFF,
         )
     )
+    if can_id is not None:
+        if not 0 <= can_id <= 253:
+            raise ValueError(f"CAN ID {can_id} out of range [0, 253]")
+        payload = bytes((int(CommPacketId.COMM_FORWARD_CAN), can_id)) + payload
     return encode_packet(payload)
 
 
-def read_exact(serial_port: SerialLike, size: int, deadline_ns: int) -> bytes | None:
+def read_exact(serial_port: PollIo, size: int, deadline_ns: int) -> bytes | None:
     """Read exactly *size* bytes before *deadline_ns*."""
     chunks = bytearray()
     while len(chunks) < size:
@@ -491,7 +547,7 @@ def read_exact(serial_port: SerialLike, size: int, deadline_ns: int) -> bytes | 
 
 
 def read_packet(
-    serial_port: SerialLike,
+    serial_port: PollIo,
     deadline_ns: int,
     stats: ReaderStats,
 ) -> bytes | None:
@@ -551,7 +607,7 @@ def read_packet(
 
 
 def read_expected_imu_packet(
-    serial_port: SerialLike,
+    serial_port: PollIo,
     packet_timeout: float,
     reader_stats: ReaderStats,
 ) -> bytes | None:
@@ -571,7 +627,7 @@ def open_serial(
     baudrate: int,
     timeout: float,
     exclusive: bool,
-) -> SerialLike:
+) -> PollIo:
     """Open a low-overhead serial connection to the USB CDC device."""
     kwargs = {
         "port": port,
@@ -590,26 +646,43 @@ def open_serial(
     except TypeError:
         raw_serial = serial.Serial(**kwargs)
 
-    serial_port = cast(SerialLike, raw_serial)
+    serial_port = cast(PollIo, raw_serial)
     serial_port.reset_input_buffer()
     return serial_port
 
 
-class SharedSerialTransport(Transport):
-    """VescClient transport that reuses the already-open fast-poller serial port."""
+def open_ble(
+    address: str,
+    *,
+    connect_timeout: float,
+    chunk_size: int,
+) -> PollIo:
+    """Open a direct BLE connection and adapt it to the poller's byte-stream API."""
+    from vesc_py.ble import BleTransport  # pylint: disable=import-outside-toplevel
 
-    def __init__(self, serial_port: SerialLike) -> None:
-        self._serial_port = serial_port
+    transport = BleTransport(
+        address,
+        connect_timeout=connect_timeout,
+        chunk_size=chunk_size,
+    )
+    return BufferedTransportIO(transport)
+
+
+class SharedPollTransport(Transport):
+    """VescClient transport that reuses the already-open fast-poller I/O path."""
+
+    def __init__(self, poll_io: PollIo) -> None:
+        self._poll_io = poll_io
 
     def send(self, data: bytes) -> None:
-        self._serial_port.write(data)
+        self._poll_io.write(data)
 
     def recv(self, timeout: float) -> bytes:
-        self._serial_port.timeout = timeout
-        return self._serial_port.read(4096)
+        self._poll_io.timeout = timeout
+        return self._poll_io.read(4096)
 
     def close(self) -> None:
-        """Leave ownership of the serial port with the fast poller."""
+        """Leave ownership of the I/O object with the fast poller."""
         return None
 
 
@@ -623,14 +696,14 @@ class PlotAppConfigClient:
     @classmethod
     def connect(
         cls,
-        serial_port: SerialLike,
+        poll_io: PollIo,
         *,
         command_lock: Any,
         timeout: float,
         fw_retries: int,
         config_dir: Path | None = None,
     ) -> PlotAppConfigClient:
-        transport = SharedSerialTransport(serial_port)
+        transport = SharedPollTransport(poll_io)
         client = VescClient(
             transport,
             timeout=timeout,
@@ -707,6 +780,79 @@ def print_serial_ports() -> None:
             tags.append("esp")
         tag_text = f" ({', '.join(tags)})" if tags else ""
         print(f"{port.system_path}{tag_text}  {port.name}")
+
+
+def scan_and_print_ble(timeout: float = 5.0) -> None:
+    """Scan for BLE devices advertising the Nordic UART service and print them."""
+    print(f"Scanning for VESC BLE devices for {timeout}s ...")
+    devices = ble_scan(timeout=timeout)
+    if not devices:
+        print("No VESC BLE devices found.")
+        return
+
+    for device in devices:
+        name = device.name or "(unnamed)"
+        rssi = "" if device.rssi is None else f"  RSSI {device.rssi} dBm"
+        print(f"  {name}  {device.address}{rssi}")
+
+
+def ble_connection_help(address: str, message: str) -> str:
+    """Return a concise hint for direct BLE connection failures."""
+    return "\n".join(
+        [
+            f"Could not connect to VESC BLE device at {address}.",
+            "",
+            message,
+            "",
+            "Use --scan-ble to list VESC BLE devices advertising Nordic UART, "
+            "then pass the printed address or OS-specific UUID to --ble.",
+        ]
+    )
+
+
+def open_poll_connection(args: argparse.Namespace) -> tuple[PollIo, str]:
+    """Open the transport selected by parsed CLI arguments."""
+    if args.ble is not None:
+        address = str(args.ble)
+        print(f"Connecting to VESC BLE device at {address} ...", file=sys.stderr)
+        try:
+            return (
+                open_ble(
+                    address,
+                    connect_timeout=args.ble_connect_timeout,
+                    chunk_size=args.ble_chunk_size,
+                ),
+                address,
+            )
+        except TimeoutError:
+            raise SystemExit(
+                ble_connection_help(
+                    address,
+                    "Timed out while connecting to the BLE peripheral.",
+                )
+            ) from None
+        except ConnectionError as exc:
+            raise SystemExit(
+                ble_connection_help(
+                    address,
+                    (
+                        f"{exc}\n\n"
+                        "The BLE link opened, but the VESC did not respond as expected. "
+                        "Make sure the BLE module is connected to a controller."
+                    ),
+                )
+            ) from None
+
+    port = args.port or autodetect_port()
+    return (
+        open_serial(
+            port,
+            args.baudrate,
+            args.timeout,
+            exclusive=not args.no_exclusive,
+        ),
+        port,
+    )
 
 
 def format_values(mask: int, values: tuple[float, ...], max_fields: int = 9) -> str:
@@ -1425,7 +1571,7 @@ class FastImuAxisPoller:
 
     def __init__(
         self,
-        serial_port: SerialLike,
+        serial_port: PollIo,
         *,
         request: bytes,
         mask: int,
@@ -1591,7 +1737,7 @@ class FastImuPlotPoller:
 
     def __init__(
         self,
-        serial_port: SerialLike,
+        serial_port: PollIo,
         *,
         request: bytes,
         mask: int,
@@ -2798,7 +2944,7 @@ def run_accel_axis_plot(
 
 
 def poll_imu(
-    serial_port: SerialLike,
+    serial_port: PollIo,
     *,
     request: bytes,
     mask: int,
@@ -2943,16 +3089,49 @@ def poll_imu(
 def build_parser() -> argparse.ArgumentParser:
     """Create the command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Poll VESC IMU data over USB serial with minimal host overhead.",
+        description="Poll VESC IMU data over USB serial or direct BLE with minimal host overhead.",
     )
     parser.add_argument(
         "--port",
         help="Serial port path. If omitted, the first discovered VESC-like port is used.",
     )
     parser.add_argument(
+        "--ble",
+        help=(
+            "Connect directly to a VESC BLE module by address or OS-specific UUID "
+            "instead of using USB serial."
+        ),
+    )
+    parser.add_argument(
         "--list-ports",
         action="store_true",
         help="List discovered serial ports and exit.",
+    )
+    parser.add_argument(
+        "--scan-ble",
+        action="store_true",
+        help="Scan for VESC BLE devices advertising Nordic UART and exit.",
+    )
+    parser.add_argument(
+        "--ble-scan-timeout",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="BLE scan duration in seconds (default: 5.0).",
+    )
+    parser.add_argument(
+        "--ble-connect-timeout",
+        type=float,
+        default=10.0,
+        metavar="SEC",
+        help="BLE connection timeout in seconds (default: 10.0).",
+    )
+    parser.add_argument(
+        "--ble-chunk-size",
+        type=int,
+        default=20,
+        metavar="BYTES",
+        help="Maximum BLE Nordic UART write chunk size in bytes (default: 20).",
     )
     parser.add_argument(
         "--baudrate",
@@ -2969,6 +3148,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TIMEOUT,
         metavar="SEC",
         help="Per-response timeout in seconds (default: 0.1).",
+    )
+    parser.add_argument(
+        "--can-id",
+        type=int,
+        metavar="ID",
+        help=(
+            "Forward IMU requests through the directly connected controller "
+            "to this remote VESC CAN ID."
+        ),
     )
     parser.add_argument(
         "--mask",
@@ -3169,16 +3357,27 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.list_ports and args.scan_ble:
+        parser.error("use only one of --list-ports or --scan-ble")
     if args.list_ports:
         print_serial_ports()
         return
+    if args.scan_ble:
+        if args.ble_scan_timeout <= 0.0:
+            parser.error("--ble-scan-timeout must be greater than 0")
+        scan_and_print_ble(args.ble_scan_timeout)
+        return
 
+    if args.port is not None and args.ble is not None:
+        parser.error("--port and --ble are mutually exclusive")
     if args.mask is not None and args.fields is not None:
         parser.error("--mask and --fields are mutually exclusive")
     if args.baudrate <= 0:
         parser.error("--baudrate must be greater than 0")
     if args.timeout <= 0.0:
         parser.error("--timeout must be greater than 0")
+    if args.can_id is not None and not 0 <= args.can_id <= 253:
+        parser.error("--can-id must be in range [0, 253]")
     if args.duration < 0.0:
         parser.error("--duration must be greater than or equal to 0")
     if args.max_samples < 0:
@@ -3207,12 +3406,21 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--print-every must be greater than or equal to 0")
     if args.pipeline_depth <= 0:
         parser.error("--pipeline-depth must be greater than 0")
+    if args.ble_connect_timeout <= 0.0:
+        parser.error("--ble-connect-timeout must be greater than 0")
+    if args.ble_chunk_size <= 0:
+        parser.error("--ble-chunk-size must be greater than 0")
     if args.plot and args.csv:
         parser.error("--plot cannot be combined with --csv")
     if args.plot and args.no_decode:
         parser.error("--plot cannot be combined with --no-decode")
     if args.plot and args.print_every > 0:
         parser.error("--plot cannot be combined with --print-every")
+    if args.plot and args.can_id is not None and not args.no_app_config_controls:
+        parser.error(
+            "--plot with --can-id requires --no-app-config-controls because "
+            "the live app-config client only targets the directly connected controller"
+        )
 
     mask = DEFAULT_MASK
     if args.fields is not None:
@@ -3246,23 +3454,24 @@ def main(argv: Sequence[str] | None = None) -> None:
         else None
     )
 
-    port = args.port or autodetect_port()
-    request = build_imu_request(mask)
+    request = build_imu_request(mask, can_id=args.can_id)
     fields = ", ".join(field_names_for_mask(mask))
+    target_label = "" if args.can_id is None else f"; target_can_id={args.can_id}"
 
+    serial_port, connection_label = open_poll_connection(args)
+    link_label = (
+        f"BLE {connection_label}"
+        if args.ble is not None
+        else f"{connection_label} at {args.baudrate} baud"
+    )
     print(
-        f"Opening {port} at {args.baudrate} baud; mask=0x{mask:04x} ({fields}); "
+        f"Opening {link_label}; mask=0x{mask:04x} ({fields}); "
         f"pipeline_depth={args.pipeline_depth}; "
-        f"display={'plot' if args.plot else 'tui' if tui is not None else 'plain'}",
+        f"display={'plot' if args.plot else 'tui' if tui is not None else 'plain'}"
+        f"{target_label}",
         file=sys.stderr,
     )
     print(HOST_RX_TIMING_NOTICE, file=sys.stderr)
-    serial_port = open_serial(
-        port,
-        args.baudrate,
-        args.timeout,
-        exclusive=not args.no_exclusive,
-    )
     command_lock = threading.RLock()
     app_config_client: PlotAppConfigClient | None = None
     app_config_error: str | None = None

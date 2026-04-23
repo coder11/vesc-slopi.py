@@ -7,6 +7,8 @@ import pytest
 from examples.poll_imu_fast import (
     AxisPlotHistory,
     AxisSampleBuffer,
+    build_imu_request,
+    build_parser,
     HOST_RX_TIMING_NOTICE,
     HOST_RX_TIMESTAMP_SOURCE,
     IMU_PLOT_CHANNELS,
@@ -16,10 +18,15 @@ from examples.poll_imu_fast import (
     axis_frequency_spectrum,
     field_value_index,
     imu_frequency_spectrum,
+    open_poll_connection,
     parse_accel_axis_arg,
+    scan_and_print_ble,
     write_csv_header,
     write_sample,
 )
+from vesc_py import BleDevice
+from vesc_py.comm_ids import CommPacketId
+from vesc_py.packet import encode_packet
 
 
 def test_field_value_index_matches_compacted_response_values() -> None:
@@ -37,6 +44,109 @@ def test_parse_accel_axis_accepts_short_and_field_names() -> None:
 
     with pytest.raises(argparse.ArgumentTypeError):
         parse_accel_axis_arg("roll")
+
+
+def test_parser_accepts_ble_connection_options() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "--ble",
+            "AA:BB:CC:DD:EE:FF",
+            "--timeout",
+            "1.5",
+            "--ble-connect-timeout",
+            "2.5",
+            "--ble-chunk-size",
+            "64",
+        ]
+    )
+
+    assert args.ble == "AA:BB:CC:DD:EE:FF"
+    assert args.timeout == pytest.approx(1.5)
+    assert args.ble_connect_timeout == pytest.approx(2.5)
+    assert args.ble_chunk_size == 64
+
+
+def test_parser_accepts_can_id() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["--ble", "AA:BB:CC:DD:EE:FF", "--can-id", "7"])
+
+    assert args.can_id == 7
+
+
+def test_build_imu_request_wraps_can_forwarding() -> None:
+    request = build_imu_request(0x01FF, can_id=7)
+
+    assert request == encode_packet(
+        bytes(
+            [
+                CommPacketId.COMM_FORWARD_CAN,
+                7,
+                CommPacketId.COMM_GET_IMU_DATA,
+                0x01,
+                0xFF,
+            ]
+        )
+    )
+
+
+def test_open_poll_connection_uses_ble_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--ble",
+            "AA:BB:CC:DD:EE:FF",
+            "--timeout",
+            "1.5",
+            "--ble-connect-timeout",
+            "2.5",
+            "--ble-chunk-size",
+            "64",
+        ]
+    )
+    fake_transport = object()
+    calls: dict[str, object] = {}
+
+    def fake_open_ble(address: str, **kwargs: object) -> object:
+        calls["address"] = address
+        calls.update(kwargs)
+        return fake_transport
+
+    monkeypatch.setattr("examples.poll_imu_fast.open_ble", fake_open_ble)
+
+    transport, label = open_poll_connection(args)
+
+    assert transport is fake_transport
+    assert label == "AA:BB:CC:DD:EE:FF"
+    assert calls == {
+        "address": "AA:BB:CC:DD:EE:FF",
+        "connect_timeout": 2.5,
+        "chunk_size": 64,
+    }
+
+
+def test_scan_and_print_ble_lists_discovered_devices(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fake_ble_scan(timeout: float) -> list[BleDevice]:
+        assert timeout == 0.25
+        return [
+            BleDevice(name="VESC BLE", address="AA:BB:CC:DD:EE:FF", rssi=-51),
+            BleDevice(name="", address="11:22:33:44:55:66", rssi=None),
+        ]
+
+    monkeypatch.setattr("examples.poll_imu_fast.ble_scan", fake_ble_scan)
+
+    scan_and_print_ble(timeout=0.25)
+
+    output = capsys.readouterr().out
+    assert "VESC BLE  AA:BB:CC:DD:EE:FF  RSSI -51 dBm" in output
+    assert "(unnamed)  11:22:33:44:55:66" in output
 
 
 def test_csv_header_labels_host_receive_timing(capsys: pytest.CaptureFixture[str]) -> None:
