@@ -1,4 +1,4 @@
-"""Generic live signal analysis runtime with pluggable sources."""
+"""YALSA application runtime with pluggable live signal sources."""
 
 from __future__ import annotations
 
@@ -919,9 +919,11 @@ __all__ = [
     "ChoiceOption",
     "FloatArray",
     "LiveAnalysisApp",
+    "ParamValue",
     "ParameterSpec",
     "PlotSpec",
     "PlotTrace",
+    "ProcessCallback",
     "ScalarSignalSourceAdapter",
     "SeriesData",
     "SignalBatch",

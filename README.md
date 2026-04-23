@@ -39,8 +39,8 @@ uv run examples/poll_imu_fast.py --port /dev/ttyACM0
 uv run examples/imu_live_plot.py --tcp 127.0.0.1:65102
 uv run examples/imu_live_plot.py --scan-ble
 uv run examples/imu_live_plot.py --ble AA:BB:CC:DD:EE:FF
-uv run examples/live_signal_analysis.py --source deterministic --axis acc_z
-uv run examples/live_signal_analysis.py --source vesc --axis acc_z --pipeline-depth 4
+uv run examples/yalsa/live_signal_analysis.py --source deterministic --axis acc_z
+uv run examples/yalsa/live_signal_analysis.py --source vesc --axis acc_z --pipeline-depth 4
 uv run examples/config_tui.py --tcp 127.0.0.1:65102
 ```
 
@@ -59,7 +59,7 @@ Tests are intended to be unit tests and do not require VESC hardware.
 
 ## Live Analysis Scripts
 
-`examples/live_signal_analysis.py` is a generic PyQtGraph-based runtime for
+`examples/yalsa/live_signal_analysis.py` is a YALSA-based PyQtGraph runtime for
 live signal sources, tunable parameters, and arbitrary Python processing. The
 proof-of-concept pipeline analyzes one VESC IMU axis with a SciPy Butterworth
 low-pass and time/frequency plots.

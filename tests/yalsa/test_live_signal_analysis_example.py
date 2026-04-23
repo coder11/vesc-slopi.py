@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 import pytest
 
-from examples.live_signal_analysis import (
+from examples.yalsa.live_signal_analysis import (
     build_analysis,
     build_axis_analysis_processor,
     build_parser,
@@ -11,7 +11,7 @@ from examples.live_signal_analysis import (
     make_source,
     validate_args,
 )
-from vesc_py.live_analysis import AnalysisInput, SignalBatch, SignalBatchSourceSnapshot
+from yalsa import AnalysisInput, SignalBatch, SignalBatchSourceSnapshot
 
 
 def test_clamp_cutoff_hz_limits_requested_frequency_to_nyquist_margin() -> None:

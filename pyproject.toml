@@ -27,16 +27,16 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/vesc_py"]
+packages = ["src/vesc_py", "src/yalsa"]
 
 [tool.poe.tasks]
 lint = "pylint src/vesc_py"
-typecheck = "mypy --strict src/vesc_py examples"
+typecheck = "mypy --strict src/vesc_py src/yalsa examples"
 test = "pytest"
 
 [tool.mypy]
 strict = true
-files = ["src/vesc_py", "examples"]
+files = ["src/vesc_py", "src/yalsa", "examples"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

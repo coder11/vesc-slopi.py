@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generic live signal analysis app with a VESC IMU axis proof of concept.
+"""YALSA app with a VESC IMU axis proof of concept.
 
 Examples:
-    uv run examples/live_signal_analysis.py --source deterministic --axis acc_z
-    uv run examples/live_signal_analysis.py --source deterministic-white-noise --axis gyro_z
-    uv run examples/live_signal_analysis.py --source vesc --axis acc_z --pipeline-depth 4
+    uv run examples/yalsa/live_signal_analysis.py --source deterministic --axis acc_z
+    uv run examples/yalsa/live_signal_analysis.py --source deterministic-white-noise --axis gyro_z
+    uv run examples/yalsa/live_signal_analysis.py --source vesc --axis acc_z --pipeline-depth 4
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from vesc_py.fast_imu_source import (
     imu_axis_unit,
     parse_imu_axis,
 )
-from vesc_py.live_analysis import (
+from yalsa import (
     AnalysisInput,
     AnalysisResult,
     ChoiceOption,
@@ -38,14 +38,12 @@ from vesc_py.live_analysis import (
     choice_parameter,
     float_parameter,
     int_parameter,
-    run_live_analysis,
-    xy_series,
-)
-from vesc_py.live_analysis_dsp import (
     butter_lowpass_hz,
     fft_magnitude,
+    run_live_analysis,
     signal_stats,
     welch_psd,
+    xy_series,
 )
 from vesc_py.live_signal import (
     DeterministicSignalSource,

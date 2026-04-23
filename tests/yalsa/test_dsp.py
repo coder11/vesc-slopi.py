@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from vesc_py.live_analysis_dsp import (
+from yalsa import (
     butter_lowpass_hz,
     fft_magnitude,
     measured_sample_rate_hz,

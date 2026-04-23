@@ -3,7 +3,7 @@ import time
 import numpy as np
 import pytest
 
-from vesc_py.live_analysis import (
+from yalsa import (
     ChoiceOption,
     ScalarSignalSourceAdapter,
     SignalBatch,

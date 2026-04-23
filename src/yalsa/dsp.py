@@ -1,4 +1,4 @@
-"""DSP helpers for live analysis scripts."""
+"""DSP helpers for YALSA scripts."""
 
 from __future__ import annotations
 
