@@ -1,4 +1,12 @@
-# vesc-py
+# AI slop warning
+
+This repository was 100% vibecoded with llm for research and prototyping purposes.
+Be **extra** cautions and when using it with the real hardware.
+
+VESC is a registered trademark of Benjamin Vedder. Read the [original trademark policies](https://vesc-project.com/trademark_policies) for more information.
+There is no intention to replace the original [vesc_tool](https://github.com/vedderb/vesc_tool)
+
+# vesc.(slopi)py
 
 Pure-Python programmatic API for talking to VESC hardware over serial, TCP, or
 BLE.
