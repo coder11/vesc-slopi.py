@@ -29,6 +29,8 @@ Run scripts and tools with `uv run` from the repository root:
 uv run examples/discover_vescs.py
 uv run examples/poll_imu_fast.py --port /dev/ttyACM0
 uv run examples/imu_live_plot.py --tcp 127.0.0.1:65102
+uv run examples/imu_live_plot.py --scan-ble
+uv run examples/imu_live_plot.py --ble AA:BB:CC:DD:EE:FF
 uv run examples/config_tui.py --tcp 127.0.0.1:65102
 ```
 

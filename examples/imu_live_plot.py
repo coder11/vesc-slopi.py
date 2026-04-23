@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live IMU plot through the VESC Tool TCP server.
+"""Live IMU plot through the VESC Tool TCP server or direct BLE.
 
 Start the bridge first, for example:
     ./vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102
@@ -8,7 +8,10 @@ Usage:
     uv run examples/imu_live_plot.py
     uv run examples/imu_live_plot.py --theme dark
     uv run examples/imu_live_plot.py --tcp 192.168.1.50:65102
+    uv run examples/imu_live_plot.py --ble AA:BB:CC:DD:EE:FF
+    uv run examples/imu_live_plot.py --ble AA:BB:CC:DD:EE:FF --can-id 1
     uv run examples/imu_live_plot.py --scan-udp
+    uv run examples/imu_live_plot.py --scan-ble
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from typing import Any, cast
 import numpy as np
 import numpy.typing as npt
 
-from vesc_py import ImuValues, VescClient, udp_scan
+from vesc_py import ImuValues, VescClient, ble_scan, udp_scan
 
 DEFAULT_TCP_ENDPOINT = ("127.0.0.1", 65102)
 DEFAULT_MASK = 0x01FF  # roll/pitch/yaw + accelerometer + gyroscope.
@@ -196,10 +199,12 @@ class ImuPoller:
         *,
         mask: int,
         poll_hz: float,
+        can_id: int | None = None,
         max_queue: int = 500,
     ) -> None:
         self._client = client
         self._mask = mask
+        self._can_id = can_id
         self._period = 1.0 / poll_hz
         self._samples: queue.Queue[ImuSample] = queue.Queue(maxsize=max_queue)
         self._stop = threading.Event()
@@ -239,7 +244,7 @@ class ImuPoller:
         next_poll = time.monotonic()
         while not self._stop.is_set():
             try:
-                imu = self._client.get_imu_data(self._mask)
+                imu = self._client.get_imu_data(self._mask, can_id=self._can_id)
             except Exception as exc:  # Keep polling; transient TCP stalls are common enough.
                 self._last_error = str(exc)
             else:
@@ -312,6 +317,20 @@ def scan_and_print_udp(timeout: float = 3.0) -> None:
         print(f"  {device.hw_name}  {device.ip}:{device.port}")
 
 
+def scan_and_print_ble(timeout: float = 5.0) -> None:
+    """Scan for BLE devices advertising the Nordic UART service and print them."""
+    print(f"Scanning for VESC BLE devices for {timeout}s ...")
+    devices = ble_scan(timeout=timeout)
+    if not devices:
+        print("No VESC BLE devices found.")
+        return
+
+    for device in devices:
+        name = device.name or "(unnamed)"
+        rssi = "" if device.rssi is None else f"  RSSI {device.rssi} dBm"
+        print(f"  {name}  {device.address}{rssi}")
+
+
 def tcp_server_help(endpoint: str, port: int) -> str:
     """Return a concise hint for starting the VESC Tool TCP bridge."""
     return "\n".join(
@@ -322,6 +341,20 @@ def tcp_server_help(endpoint: str, port: int) -> str:
             f"  vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer {port}",
             "",
             "If VESC Tool is already running, check the host and port passed to --tcp.",
+        ]
+    )
+
+
+def ble_connection_help(address: str, message: str) -> str:
+    """Return a concise hint for direct BLE connection failures."""
+    return "\n".join(
+        [
+            f"Could not connect to VESC BLE device at {address}.",
+            "",
+            message,
+            "",
+            "Use --scan-ble to list VESC BLE devices advertising Nordic UART, "
+            "then pass the printed address or OS-specific UUID to --ble.",
         ]
     )
 
@@ -768,10 +801,11 @@ def run_live_plot(
 def build_parser() -> argparse.ArgumentParser:
     """Create the command-line parser."""
     parser = argparse.ArgumentParser(
-        description="Plot live VESC IMU data through a VESC Tool --tcpServer bridge.",
+        description="Plot live VESC IMU data through TCP or direct BLE.",
         epilog=(
-            "Start VESC Tool first, for example: "
-            "vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102"
+            "TCP mode uses a VESC Tool bridge, for example: "
+            "vesc_tool --offscreen --vescPort /dev/ttyACM0 --tcpServer 65102. "
+            "BLE mode connects directly to a VESC BLE module advertising Nordic UART."
         ),
     )
     parser.add_argument(
@@ -779,7 +813,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_tcp_endpoint,
         default=DEFAULT_TCP_ENDPOINT,
         metavar="HOST:PORT",
-        help="VESC Tool TCP server endpoint (default: 127.0.0.1:65102).",
+        help=(
+            "VESC Tool TCP server endpoint used when --ble is not set "
+            "(default: 127.0.0.1:65102)."
+        ),
+    )
+    parser.add_argument(
+        "--ble",
+        metavar="ADDRESS",
+        help=(
+            "Connect directly to a VESC BLE module by address or OS-specific UUID "
+            "instead of using --tcp."
+        ),
+    )
+    parser.add_argument(
+        "--can-id",
+        type=int,
+        metavar="ID",
+        help=(
+            "Forward IMU requests over CAN to the target VESC ID. "
+            "Use this when connected to a VESC Express gateway."
+        ),
     )
     parser.add_argument(
         "--scan-udp",
@@ -787,11 +841,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Scan for VESC Tool TCP server UDP broadcasts and exit.",
     )
     parser.add_argument(
+        "--scan-ble",
+        action="store_true",
+        help="Scan for VESC BLE devices advertising Nordic UART and exit.",
+    )
+    parser.add_argument(
         "--scan-timeout",
         type=float,
         default=3.0,
         metavar="SEC",
         help="UDP scan duration in seconds (default: 3.0).",
+    )
+    parser.add_argument(
+        "--ble-scan-timeout",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="BLE scan duration in seconds (default: 5.0).",
+    )
+    parser.add_argument(
+        "--ble-connect-timeout",
+        type=float,
+        default=10.0,
+        metavar="SEC",
+        help="BLE connection timeout in seconds (default: 10.0).",
+    )
+    parser.add_argument(
+        "--ble-chunk-size",
+        type=int,
+        default=20,
+        metavar="BYTES",
+        help="Maximum BLE Nordic UART write chunk size in bytes (default: 20).",
     )
     parser.add_argument(
         "--timeout",
@@ -847,12 +927,68 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def connect_vesc(args: argparse.Namespace) -> VescClient:
+    """Open the transport selected by parsed CLI arguments."""
+    if args.ble is not None:
+        address = str(args.ble)
+        print(f"Connecting to VESC BLE device at {address} ...")
+        try:
+            return VescClient.connect_ble(
+                address,
+                timeout=args.timeout,
+                connect_timeout=args.ble_connect_timeout,
+                chunk_size=args.ble_chunk_size,
+            )
+        except TimeoutError:
+            raise SystemExit(
+                ble_connection_help(
+                    address,
+                    "Timed out while connecting to the BLE peripheral.",
+                )
+            ) from None
+        except ConnectionError as exc:
+            raise SystemExit(
+                ble_connection_help(
+                    address,
+                    (
+                        f"{exc}\n\n"
+                        "The BLE link opened, but no VESC firmware response was received. "
+                        "Make sure the BLE module is connected to a controller."
+                    ),
+                )
+            ) from None
+
+    host, port = args.tcp
+    endpoint = f"{host}:{port}"
+    print(f"Connecting to VESC Tool TCP server at {endpoint} ...")
+    try:
+        return VescClient.connect_tcp(host, port, timeout=args.timeout)
+    except ConnectionRefusedError:
+        raise SystemExit(tcp_server_help(endpoint, port)) from None
+    except ConnectionError as exc:
+        raise SystemExit(
+            f"{exc}\n\n"
+            "The TCP socket opened, but no VESC firmware response was received. "
+            "Make sure VESC Tool is connected to a controller before starting the plot."
+        ) from None
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.scan_udp and args.scan_ble:
+        parser.error("use only one of --scan-udp or --scan-ble")
+    if args.scan_timeout <= 0.0:
+        raise SystemExit("--scan-timeout must be greater than 0")
+    if args.ble_scan_timeout <= 0.0:
+        raise SystemExit("--ble-scan-timeout must be greater than 0")
+
     if args.scan_udp:
         scan_and_print_udp(args.scan_timeout)
+        return
+    if args.scan_ble:
+        scan_and_print_ble(args.ble_scan_timeout)
         return
 
     if args.rate <= 0.0:
@@ -863,26 +999,28 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise SystemExit("--history must be greater than 0")
     if args.timeout <= 0.0:
         raise SystemExit("--timeout must be greater than 0")
+    if args.ble_connect_timeout <= 0.0:
+        raise SystemExit("--ble-connect-timeout must be greater than 0")
+    if args.ble_chunk_size <= 0:
+        raise SystemExit("--ble-chunk-size must be greater than 0")
+    if args.can_id is not None and not 0 <= args.can_id <= 253:
+        raise SystemExit("--can-id must be in range [0, 253]")
 
-    host, port = args.tcp
-    endpoint = f"{host}:{port}"
-    print(f"Connecting to VESC Tool TCP server at {endpoint} ...")
-    try:
-        client = VescClient.connect_tcp(host, port, timeout=args.timeout)
-    except ConnectionRefusedError:
-        raise SystemExit(tcp_server_help(endpoint, port)) from None
-    except ConnectionError as exc:
-        raise SystemExit(
-            f"{exc}\n\n"
-            "The TCP socket opened, but no VESC firmware response was received. "
-            "Make sure VESC Tool is connected to a controller before starting the plot."
-        ) from None
-    poller = ImuPoller(client, mask=args.mask, poll_hz=args.rate)
+    client = connect_vesc(args)
+    poller = ImuPoller(client, mask=args.mask, poll_hz=args.rate, can_id=args.can_id)
 
     try:
-        fw = client.fw_version
-        if fw is not None:
-            print(f"Firmware: {fw.major}.{fw.minor:02d}  HW: {fw.hw}")
+        gateway_fw = client.fw_version
+        if args.can_id is not None and gateway_fw is not None:
+            print(f"Gateway firmware: {gateway_fw.major}.{gateway_fw.minor:02d}  HW: {gateway_fw.hw}")
+        if args.can_id is not None:
+            target_fw = client.get_fw_version(can_id=args.can_id, timeout=args.timeout)
+            print(
+                "Target firmware: "
+                f"{target_fw.major}.{target_fw.minor:02d}  HW: {target_fw.hw}  CAN ID: {args.can_id}"
+            )
+        elif gateway_fw is not None:
+            print(f"Firmware: {gateway_fw.major}.{gateway_fw.minor:02d}  HW: {gateway_fw.hw}")
         poller.start()
         run_live_plot(
             poller,

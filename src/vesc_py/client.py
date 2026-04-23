@@ -258,9 +258,17 @@ class VescClient:
 
         return list(payload[1:])
 
-    def get_imu_data(self, mask: int = 0xFFFF) -> ImuValues:
+    def get_imu_data(
+        self,
+        mask: int = 0xFFFF,
+        *,
+        can_id: int | None = None,
+    ) -> ImuValues:
         """Request IMU data with the given field mask."""
-        self._send_command(build_get_imu_data(mask))
+        request = build_get_imu_data(mask)
+        if can_id is not None:
+            request = self._forward_can_payload(request, can_id)
+        self._send_command(request)
         payload = self._recv_response(
             expected_cmds={int(CommPacketId.COMM_GET_IMU_DATA)},
         )
