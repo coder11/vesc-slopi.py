@@ -33,9 +33,6 @@ lint = "pylint src/vesc_py"
 typecheck = "mypy --strict src/vesc_py examples"
 test = "pytest"
 
-[tool.poe.tasks.check]
-sequence = ["lint", "typecheck", "test"]
-
 [tool.mypy]
 strict = true
 files = ["src/vesc_py", "examples"]

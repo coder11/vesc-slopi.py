@@ -40,6 +40,7 @@ For examples that use the VESC Tool TCP bridge, start VESC Tool separately with
 ```bash
 uv sync --extra dev
 uv run poe test
+uv run poe typecheck
 ```
 
 Tests are intended to be unit tests and do not require VESC hardware.
