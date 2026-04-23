@@ -7,9 +7,10 @@ import argparse
 import math
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Sequence, cast
+from typing import Literal, Sequence, SupportsFloat, SupportsInt, cast
 
 from textual import events
 from textual.app import App, ComposeResult
@@ -34,8 +35,19 @@ from textual.widgets.tree import TreeNode
 from vesc_py import VescClient
 from vesc_py.config_schema import CfgType, ConfigParam, ConfigSchema
 
-ConfigKind = Literal["mcconf", "appconf"]
-CONFIG_KINDS: tuple[ConfigKind, ConfigKind] = ("mcconf", "appconf")
+ConfigKind = str
+SchemaKind = Literal["mcconf", "appconf"]
+
+
+@dataclass(frozen=True)
+class ConfigEntry:
+    kind: ConfigKind
+    schema_kind: SchemaKind
+    label: str
+    short_label: str
+    can_id: int | None
+    schema: ConfigSchema
+    values: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -62,6 +74,20 @@ def _parse_tcp_endpoint(endpoint: str) -> tuple[str, int]:
     if port < 1 or port > 65535:
         raise argparse.ArgumentTypeError("TCP port must be in range 1..65535")
     return host, port
+
+
+def _parse_can_id(value: str) -> int:
+    try:
+        can_id = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("CAN ID must be an integer") from exc
+    if not 0 <= can_id <= 253:
+        raise argparse.ArgumentTypeError("CAN ID must be in range 0..253")
+    return can_id
+
+
+def _is_vesc_express_hw(hw: str) -> bool:
+    return hw.strip().lower().startswith("vesc express")
 
 
 def _range_text(param: ConfigParam) -> str:
@@ -109,17 +135,19 @@ def format_value(param: ConfigParam, value: object) -> str:
     """Format a config value for display/editing."""
 
     if param.type == CfgType.DOUBLE:
-        number = float(value)
+        number = float(cast(SupportsFloat, value))
         decimals = max(0, param.decimals_double)
         return f"{number:.{decimals}f}".rstrip("0").rstrip(".") if decimals else f"{number:.0f}"
     if param.type == CfgType.ENUM and isinstance(value, int):
         if 0 <= value < len(param.enum_names):
             return f"{param.enum_names[value]} ({value})"
     if param.type == CfgType.BOOL:
-        return f"{bool(int(value))} ({int(value)})"
+        int_value = int(cast(SupportsInt, value))
+        return f"{bool(int_value)} ({int_value})"
     if param.type == CfgType.BITFIELD:
+        int_value = int(cast(SupportsInt, value))
         selected = [
-            label for index, label in enumerate(param.enum_names) if int(value) & (1 << index)
+            label for index, label in enumerate(param.enum_names) if int_value & (1 << index)
         ]
         return ", ".join(selected) if selected else "None"
     return str(value)
@@ -139,7 +167,10 @@ def step_numeric_value(
 
     clamped = False
     if param.type == CfgType.INT:
-        next_value = int(value) + direction * max(1, param.step_int) * multiplier
+        next_value = (
+            int(cast(SupportsInt, value))
+            + direction * max(1, param.step_int) * multiplier
+        )
         if next_value < param.min_int:
             next_value = param.min_int
             clamped = True
@@ -148,7 +179,10 @@ def step_numeric_value(
             clamped = True
         return next_value, clamped
 
-    next_float = float(value) + direction * param.step_double * multiplier
+    next_float = (
+        float(cast(SupportsFloat, value))
+        + direction * param.step_double * multiplier
+    )
     if next_float < param.min_double:
         next_float = param.min_double
         clamped = True
@@ -265,7 +299,7 @@ class ApplyChangesModal(ModalScreen[bool]):
     def compose(self) -> ComposeResult:
         with Vertical(id="apply-dialog"):
             yield Label(f"Apply {len(self._rows)} changed field(s)?")
-            table = DataTable(id="changes-table")
+            table: DataTable[object] = DataTable(id="changes-table")
             table.add_columns("Config", "Field", "Name", "Old", "New")
             for row in self._rows:
                 table.add_row(*row)
@@ -330,7 +364,7 @@ class HelpModal(ModalScreen[None]):
                     "pageup/pagedown: adjust numeric editor by 10x step",
                     "enter: edit/commit",
                     "/: search",
-                    "m / a: quicknav to motor/app config",
+                    "m / a / x: quicknav to motor/app/express config",
                     "r: revert selected field",
                     "R: revert all fields",
                     "ctrl+s: review and apply changes",
@@ -430,6 +464,7 @@ class ConfigTuiApp(App[None]):
         Binding("ctrl+s", "apply_changes", "Apply", show=True),
         Binding("m", "switch_config('mcconf')", "Motor (quicknav)", show=True),
         Binding("a", "switch_config('appconf')", "App (quicknav)", show=True),
+        Binding("x", "switch_config('express_appconf')", "Express (quicknav)", show=True),
         Binding("r", "revert_selected", "Revert field", show=False),
         Binding("R", "revert_all", "Revert all", show=False),
         Binding("t", "toggle_theme", "Theme", show=True),
@@ -443,27 +478,25 @@ class ConfigTuiApp(App[None]):
         *,
         client: VescClient,
         endpoint: str,
-        mc_schema: ConfigSchema,
-        app_schema: ConfigSchema,
-        mc_values: dict[str, object],
-        app_values: dict[str, object],
+        entries: Sequence[ConfigEntry],
     ) -> None:
         super().__init__()
+        if not entries:
+            raise ValueError("entries must not be empty")
         self.client = client
         self.endpoint = endpoint
+        self.config_order: tuple[ConfigKind, ...] = tuple(entry.kind for entry in entries)
+        self.entries: dict[ConfigKind, ConfigEntry] = {entry.kind: entry for entry in entries}
         self.schemas: dict[ConfigKind, ConfigSchema] = {
-            "mcconf": mc_schema,
-            "appconf": app_schema,
+            entry.kind: entry.schema for entry in entries
         }
         self.original: dict[ConfigKind, dict[str, object]] = {
-            "mcconf": dict(mc_values),
-            "appconf": dict(app_values),
+            entry.kind: dict(entry.values) for entry in entries
         }
         self.current: dict[ConfigKind, dict[str, object]] = {
-            "mcconf": dict(mc_values),
-            "appconf": dict(app_values),
+            entry.kind: dict(entry.values) for entry in entries
         }
-        self.active_kind: ConfigKind = "mcconf"
+        self.active_kind: ConfigKind = self.config_order[0]
         self.selected: ParamRef | None = None
         self._checkboxes: list[Checkbox] = []
         self._config_nodes: dict[ConfigKind, TreeNode[object]] = {}
@@ -513,7 +546,7 @@ class ConfigTuiApp(App[None]):
 
     def _dirty_refs(self) -> list[ParamRef]:
         refs: list[ParamRef] = []
-        for kind in CONFIG_KINDS:
+        for kind in self.config_order:
             schema = self.schemas[kind]
             for name in schema.ser_order:
                 if self.current[kind].get(name) != self.original[kind].get(name):
@@ -532,9 +565,12 @@ class ConfigTuiApp(App[None]):
         self.query_one("#status", Static).update(message + suffix)
 
     def _refresh_tabs(self) -> None:
-        motor = "[Motor]" if self.active_kind == "mcconf" else " Motor "
-        app = "[App]" if self.active_kind == "appconf" else " App "
-        self.query_one("#tabs", Static).update(f"{motor}  {app}")
+        labels = []
+        for kind in self.config_order:
+            entry = self.entries[kind]
+            label = entry.short_label
+            labels.append(f"[{label}]" if self.active_kind == kind else f" {label} ")
+        self.query_one("#tabs", Static).update("  ".join(labels))
 
     def _matches_query(
         self,
@@ -582,12 +618,9 @@ class ConfigTuiApp(App[None]):
         query = self.query_one("#search", Input).value.strip()
         expand_matches = len(query) >= 2
 
-        config_labels: tuple[tuple[ConfigKind, str], tuple[ConfigKind, str]] = (
-            ("mcconf", "Motor Config"),
-            ("appconf", "App Config"),
-        )
-        for kind, label in config_labels:
-            kind_node = tree.root.add(label, data=kind)
+        for kind in self.config_order:
+            entry = self.entries[kind]
+            kind_node = tree.root.add(entry.label, data=kind)
             self._config_nodes[kind] = kind_node
             if expand_matches or kind == self.active_kind:
                 kind_node.expand()
@@ -655,7 +688,7 @@ class ConfigTuiApp(App[None]):
 
     def on_tree_node_selected(self, event: Tree.NodeSelected[object]) -> None:
         data = event.node.data
-        if data == "mcconf" or data == "appconf":
+        if isinstance(data, str) and data in self.entries:
             self.action_switch_config(data)
             return
         if isinstance(data, ParamRef):
@@ -675,9 +708,11 @@ class ConfigTuiApp(App[None]):
         param = self._param(ref)
         value = self.current[ref.kind].get(ref.name, "")
         self._hide_editors()
+        entry = self.entries[ref.kind]
+        target = "local" if entry.can_id is None else f"CAN {entry.can_id}"
         self.query_one("#title", Static).update(param.long_name or ref.name)
         self.query_one("#meta", Static).update(
-            f"{ref.kind} | {ref.name} | {param.type.name}"
+            f"{entry.label} | {target} | {entry.schema_kind} | {ref.name} | {param.type.name}"
             + (f" | range {_range_text(param)}" if _range_text(param) else "")
         )
         original = self.original[ref.kind].get(ref.name, "")
@@ -699,21 +734,21 @@ class ConfigTuiApp(App[None]):
             editor.placeholder = _range_text(param) or "Value"
             editor.styles.display = "block"
         elif param.type == CfgType.ENUM:
-            editor = self.query_one("#enum-editor", Select)
+            enum_editor = self.query_one("#enum-editor", Select)
             options = [(label, index) for index, label in enumerate(param.enum_names)]
-            with editor.prevent(Select.Changed):
-                editor.set_options(options)
-                editor.value = int(value)
-            editor.styles.display = "block"
+            with enum_editor.prevent(Select.Changed):
+                enum_editor.set_options(options)
+                enum_editor.value = int(cast(SupportsInt, value))
+            enum_editor.styles.display = "block"
         elif param.type == CfgType.BOOL:
-            editor = self.query_one("#bool-editor", Switch)
-            editor.value = bool(int(value))
-            editor.styles.display = "block"
+            switch_editor = self.query_one("#bool-editor", Switch)
+            switch_editor.value = bool(int(cast(SupportsInt, value)))
+            switch_editor.styles.display = "block"
         elif param.type == CfgType.BITFIELD:
             container = self.query_one("#bitfield-editor", Vertical)
             container.remove_children()
             self._checkboxes = []
-            int_value = int(value)
+            int_value = int(cast(SupportsInt, value))
             for index, label in enumerate(param.enum_names):
                 checkbox = Checkbox(label, value=bool(int_value & (1 << index)), id=f"bit-{index}")
                 self._checkboxes.append(checkbox)
@@ -876,14 +911,15 @@ class ConfigTuiApp(App[None]):
         self._set_status(f"Theme: {mode}")
 
     def action_switch_config(self, kind: str) -> None:
-        if kind not in {"mcconf", "appconf"}:
+        if kind not in self.entries:
+            self._set_status("Config target is not loaded")
             return
-        self.active_kind = cast(ConfigKind, kind)
+        self.active_kind = kind
         self._refresh_tabs()
         tree = self.query_one("#tree", Tree)
         tree.focus()
         tree.move_cursor(self._config_nodes.get(self.active_kind), animate=True)
-        self._set_status(f"Focused {'motor' if kind == 'mcconf' else 'app'} config")
+        self._set_status(f"Focused {self.entries[kind].label}")
 
     def action_revert_selected(self) -> None:
         if self.selected is None:
@@ -906,13 +942,10 @@ class ConfigTuiApp(App[None]):
             self._revert_all_decision,
         )
 
-    def _revert_all_decision(self, confirmed: bool) -> None:
+    def _revert_all_decision(self, confirmed: bool | None) -> None:
         if not confirmed:
             return
-        self.current = {
-            "mcconf": dict(self.original["mcconf"]),
-            "appconf": dict(self.original["appconf"]),
-        }
+        self.current = {kind: dict(self.original[kind]) for kind in self.config_order}
         self._populate_tree()
         self._show_selected()
         self._set_status("Reverted all changes")
@@ -921,9 +954,10 @@ class ConfigTuiApp(App[None]):
         rows: list[tuple[str, str, str, str, str]] = []
         for ref in self._dirty_refs():
             param = self._param(ref)
+            entry = self.entries[ref.kind]
             rows.append(
                 (
-                    "Motor" if ref.kind == "mcconf" else "App",
+                    entry.short_label,
                     param.long_name or ref.name,
                     ref.name,
                     format_value(param, self.original[ref.kind][ref.name]),
@@ -939,23 +973,37 @@ class ConfigTuiApp(App[None]):
             return
         self.push_screen(ApplyChangesModal(rows), self._apply_decision)
 
-    def _apply_decision(self, confirmed: bool) -> None:
+    def _apply_decision(self, confirmed: bool | None) -> None:
         if not confirmed:
             return
         self._set_status("Writing...")
         try:
-            if any(ref.kind == "mcconf" for ref in self._dirty_refs()):
-                self.client.set_mcconf(self.current["mcconf"], wait_ack=True)
-            if any(ref.kind == "appconf" for ref in self._dirty_refs()):
-                self.client.set_appconf(self.current["appconf"], store=True, wait_ack=True)
+            dirty_kinds = {ref.kind for ref in self._dirty_refs()}
+            for kind in self.config_order:
+                if kind not in dirty_kinds:
+                    continue
+                entry = self.entries[kind]
+                values = self.current[kind]
+                if entry.schema_kind == "mcconf":
+                    self.client.set_mcconf(
+                        values,
+                        can_id=entry.can_id,
+                        schema=entry.schema,
+                        wait_ack=True,
+                    )
+                else:
+                    self.client.set_appconf(
+                        values,
+                        can_id=entry.can_id,
+                        schema=entry.schema,
+                        store=True,
+                        wait_ack=True,
+                    )
         except Exception as exc:
             self._set_status(f"Write failed: {exc}")
             return
 
-        self.original = {
-            "mcconf": dict(self.current["mcconf"]),
-            "appconf": dict(self.current["appconf"]),
-        }
+        self.original = {kind: dict(self.current[kind]) for kind in self.config_order}
         self._populate_tree()
         self._show_selected()
         self._set_status("Applied successfully")
@@ -973,7 +1021,7 @@ class ConfigTuiApp(App[None]):
         else:
             self.exit()
 
-    def _quit_decision(self, confirmed: bool) -> None:
+    def _quit_decision(self, confirmed: bool | None) -> None:
         if confirmed:
             self.exit()
 
@@ -981,25 +1029,185 @@ class ConfigTuiApp(App[None]):
         self.push_screen(HelpModal())
 
 
-def _connect_and_load(
+def _read_config_entry(
+    client: VescClient,
+    *,
+    kind: ConfigKind,
+    schema_kind: SchemaKind,
+    label: str,
+    short_label: str,
+    can_id: int | None,
+    schema: ConfigSchema,
+) -> ConfigEntry:
+    if schema_kind == "mcconf":
+        values = client.get_mcconf(can_id=can_id, schema=schema)
+    else:
+        values = client.get_appconf(can_id=can_id, schema=schema)
+    return ConfigEntry(
+        kind=kind,
+        schema_kind=schema_kind,
+        label=label,
+        short_label=short_label,
+        can_id=can_id,
+        schema=schema,
+        values=values,
+    )
+
+
+def _read_optional_config_entry(
+    client: VescClient,
+    *,
+    kind: ConfigKind,
+    schema_kind: SchemaKind,
+    label: str,
+    short_label: str,
+    can_id: int | None,
+    schema: ConfigSchema,
+) -> ConfigEntry | None:
+    try:
+        return _read_config_entry(
+            client,
+            kind=kind,
+            schema_kind=schema_kind,
+            label=label,
+            short_label=short_label,
+            can_id=can_id,
+            schema=schema,
+        )
+    except TimeoutError:
+        return None
+
+
+def _connect_tcp(
     host: str,
     port: int,
     timeout: float,
     config_dir: Path | None,
-) -> tuple[VescClient, ConfigSchema, ConfigSchema, dict[str, object], dict[str, object]]:
-    client = VescClient.connect_tcp(host, port, timeout=timeout, config_dir=config_dir)
-    mc_schema = client.mcconf_schema
-    app_schema = client.appconf_schema
-    if mc_schema is None:
-        client.close()
-        raise RuntimeError("No local MCCONF schema found for connected firmware")
-    if app_schema is None:
-        client.close()
-        raise RuntimeError("No local APPCONF schema found for connected firmware")
+) -> VescClient:
+    return VescClient.connect_tcp(host, port, timeout=timeout, config_dir=config_dir)
 
-    mc_values = client.get_mcconf()
-    app_values = client.get_appconf()
-    return client, mc_schema, app_schema, mc_values, app_values
+
+def _connect_ble(
+    address: str,
+    timeout: float,
+    config_dir: Path | None,
+    connect_timeout: float,
+    chunk_size: int,
+) -> VescClient:
+    return VescClient.connect_ble(
+        address,
+        timeout=timeout,
+        config_dir=config_dir,
+        connect_timeout=connect_timeout,
+        chunk_size=chunk_size,
+    )
+
+
+def _connect_and_load(
+    *,
+    endpoint: str,
+    connect: Callable[[], VescClient],
+    timeout: float,
+    can_id: int | None,
+) -> tuple[VescClient, list[ConfigEntry]]:
+    client = connect()
+    entries: list[ConfigEntry] = []
+    try:
+        direct_fw = client.fw_version
+        direct_is_express = (
+            direct_fw is not None and _is_vesc_express_hw(direct_fw.hw)
+        )
+        direct_app_schema = client.appconf_schema
+        direct_mc_schema = client.mcconf_schema
+
+        if can_id is not None and direct_is_express and direct_app_schema is not None:
+            express_entry = _read_optional_config_entry(
+                client,
+                kind="express_appconf",
+                schema_kind="appconf",
+                label="VESC Express Config",
+                short_label="Express",
+                can_id=None,
+                schema=direct_app_schema,
+            )
+            if express_entry is not None:
+                entries.append(express_entry)
+
+        if can_id is None:
+            if direct_is_express and direct_app_schema is not None:
+                entries.append(
+                    _read_config_entry(
+                        client,
+                        kind="express_appconf",
+                        schema_kind="appconf",
+                        label="VESC Express Config",
+                        short_label="Express",
+                        can_id=None,
+                        schema=direct_app_schema,
+                    )
+                )
+            else:
+                if direct_mc_schema is not None:
+                    entries.append(
+                        _read_config_entry(
+                            client,
+                            kind="mcconf",
+                            schema_kind="mcconf",
+                            label="Motor Config",
+                            short_label="Motor",
+                            can_id=None,
+                            schema=direct_mc_schema,
+                        )
+                    )
+                if direct_app_schema is not None:
+                    entries.append(
+                        _read_config_entry(
+                            client,
+                            kind="appconf",
+                            schema_kind="appconf",
+                            label="App Config",
+                            short_label="App",
+                            can_id=None,
+                            schema=direct_app_schema,
+                        )
+                    )
+        else:
+            target_fw = client.get_fw_version(can_id=can_id, timeout=timeout)
+            target_app_schema, target_mc_schema = client.config_schemas_for_fw(target_fw)
+            if target_mc_schema is not None:
+                entries.append(
+                    _read_config_entry(
+                        client,
+                        kind="mcconf",
+                        schema_kind="mcconf",
+                        label=f"CAN {can_id} Motor Config",
+                        short_label="Motor",
+                        can_id=can_id,
+                        schema=target_mc_schema,
+                    )
+                )
+            if target_app_schema is not None:
+                entries.append(
+                    _read_config_entry(
+                        client,
+                        kind="appconf",
+                        schema_kind="appconf",
+                        label=f"CAN {can_id} App Config",
+                        short_label="App",
+                        can_id=can_id,
+                        schema=target_app_schema,
+                    )
+                )
+
+        if not entries:
+            raise RuntimeError(
+                f"No local config schemas found for {endpoint}"
+                + (f" / CAN {can_id}" if can_id is not None else "")
+            )
+        return client, entries
+    except Exception:
+        client.close()
+        raise
 
 
 def _connection_refused_message(endpoint: str, port: int) -> str:
@@ -1016,30 +1224,61 @@ def _connection_refused_message(endpoint: str, port: int) -> str:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description="Edit VESC motor/app configs over tcpServer")
-    parser.add_argument("--tcp", type=_parse_tcp_endpoint, required=True, metavar="HOST:PORT")
+    parser = argparse.ArgumentParser(description="Edit VESC motor/app configs")
+    connection = parser.add_mutually_exclusive_group(required=True)
+    connection.add_argument("--tcp", type=_parse_tcp_endpoint, metavar="HOST:PORT")
+    connection.add_argument("--ble", metavar="ADDRESS")
+    parser.add_argument(
+        "--can-id",
+        type=_parse_can_id,
+        default=None,
+        metavar="ID",
+        help="Edit the VESC at CAN ID through the connected device.",
+    )
     parser.add_argument("--timeout", type=float, default=2.0, metavar="SEC")
+    parser.add_argument("--ble-connect-timeout", type=float, default=10.0, metavar="SEC")
+    parser.add_argument("--ble-chunk-size", type=int, default=20, metavar="BYTES")
     parser.add_argument("--config-dir", type=Path, default=None)
     parser.add_argument("--debug", action="store_true", help="Reserved for Textual debugging")
     args = parser.parse_args(argv)
 
-    host, port = args.tcp
-    endpoint = f"{host}:{port}"
+    connect: Callable[[], VescClient]
+    if args.tcp is not None:
+        host, port = args.tcp
+        endpoint = f"{host}:{port}"
+        endpoint_label = f"tcp {endpoint}"
+        connect = lambda: _connect_tcp(host, port, args.timeout, args.config_dir)
+    else:
+        endpoint = f"ble {args.ble}"
+        endpoint_label = endpoint
+        connect = lambda: _connect_ble(
+            args.ble,
+            args.timeout,
+            args.config_dir,
+            args.ble_connect_timeout,
+            args.ble_chunk_size,
+        )
+
+    display_endpoint = endpoint_label + (
+        f" | CAN {args.can_id}" if args.can_id is not None else ""
+    )
     client: VescClient | None = None
     try:
         try:
-            client, mc_schema, app_schema, mc_values, app_values = _connect_and_load(
-                host, port, args.timeout, args.config_dir
+            client, entries = _connect_and_load(
+                endpoint=endpoint,
+                connect=connect,
+                timeout=args.timeout,
+                can_id=args.can_id,
             )
         except ConnectionRefusedError:
-            raise SystemExit(_connection_refused_message(endpoint, port)) from None
+            if args.tcp is not None:
+                raise SystemExit(_connection_refused_message(endpoint, args.tcp[1])) from None
+            raise
         app = ConfigTuiApp(
             client=client,
-            endpoint=endpoint,
-            mc_schema=mc_schema,
-            app_schema=app_schema,
-            mc_values=mc_values,
-            app_values=app_values,
+            endpoint=display_endpoint,
+            entries=entries,
         )
         app.run()
     finally:

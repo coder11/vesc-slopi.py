@@ -193,6 +193,9 @@ class BleTransport(Transport):  # pylint: disable=too-many-instance-attributes
         self._closed = True
         try:
             self._loop_thread.run(self._disconnect(), timeout=2.0)
+        except TimeoutError:
+            self._client = None
+            self._disconnected = True
         finally:
             self._loop_thread.close()
 
