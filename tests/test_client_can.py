@@ -89,6 +89,24 @@ def test_get_mcconf_sends_command_and_deserializes() -> None:
     assert _decode_sent_payload(transport.sent[0]) == bytes([CommPacketId.COMM_GET_MCCONF])
 
 
+def test_get_mcconf_can_wraps_request_and_deserializes() -> None:
+    schema = _tiny_schema("mcconf")
+    payload = bytes([CommPacketId.COMM_GET_MCCONF]) + serialize_config(schema, {"value": 43})
+    transport = FakeTransport([encode_packet(payload)])
+    client = VescClient(transport, timeout=0.1)
+
+    result = client.get_mcconf(can_id=7, schema=schema)
+
+    assert result["value"] == 43
+    assert _decode_sent_payload(transport.sent[0]) == bytes(
+        [
+            CommPacketId.COMM_FORWARD_CAN,
+            7,
+            CommPacketId.COMM_GET_MCCONF,
+        ]
+    )
+
+
 def test_set_mcconf_waits_for_ack() -> None:
     schema = _tiny_schema("mcconf")
     transport = FakeTransport([encode_packet(bytes([CommPacketId.COMM_SET_MCCONF]))])
@@ -101,6 +119,23 @@ def test_set_mcconf_waits_for_ack() -> None:
     assert payload[0] == CommPacketId.COMM_SET_MCCONF
 
 
+def test_set_mcconf_can_wraps_request_and_waits_for_ack() -> None:
+    schema = _tiny_schema("mcconf")
+    transport = FakeTransport([encode_packet(bytes([CommPacketId.COMM_SET_MCCONF]))])
+    client = VescClient(transport, timeout=0.1)
+
+    client.set_mcconf({"value": 7}, can_id=9, schema=schema, wait_ack=True)
+
+    payload = _decode_sent_payload(transport.sent[0])
+    assert payload[:3] == bytes(
+        [
+            CommPacketId.COMM_FORWARD_CAN,
+            9,
+            CommPacketId.COMM_SET_MCCONF,
+        ]
+    )
+
+
 def test_set_appconf_waits_for_ack() -> None:
     schema = _tiny_schema("appconf")
     transport = FakeTransport([encode_packet(bytes([CommPacketId.COMM_SET_APPCONF]))])
@@ -111,6 +146,23 @@ def test_set_appconf_waits_for_ack() -> None:
 
     payload = _decode_sent_payload(transport.sent[0])
     assert payload[0] == CommPacketId.COMM_SET_APPCONF
+
+
+def test_set_appconf_can_wraps_request_to_target_id() -> None:
+    schema = _tiny_schema("appconf")
+    transport = FakeTransport([encode_packet(bytes([CommPacketId.COMM_SET_APPCONF]))])
+    client = VescClient(transport, timeout=0.1)
+
+    client.set_appconf({"value": 8}, can_id=12, schema=schema, wait_ack=True)
+
+    payload = _decode_sent_payload(transport.sent[0])
+    assert payload[:3] == bytes(
+        [
+            CommPacketId.COMM_FORWARD_CAN,
+            12,
+            CommPacketId.COMM_SET_APPCONF,
+        ]
+    )
 
 
 def test_get_imu_data_skips_queued_appconf_ack() -> None:

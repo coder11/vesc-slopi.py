@@ -158,3 +158,29 @@ def test_ble_transport_remote_disconnect_makes_send_fail_but_close_cleans_up() -
 
     transport.close()
     assert fake.disconnected
+
+
+def test_ble_transport_close_swallows_disconnect_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = FakeBleClient()
+    transport = BleTransport(
+        "AA:BB:CC",
+        connect_timeout=0.2,
+        client_factory=lambda _address, _callback, _timeout: fake,
+    )
+
+    original_run = transport._loop_thread.run
+    saw_disconnect = False
+
+    def fake_run(coro, *, timeout=None):  # type: ignore[no-untyped-def]
+        nonlocal saw_disconnect
+        if getattr(coro, "cr_code", None) is not None and coro.cr_code.co_name == "_disconnect":
+            saw_disconnect = True
+            coro.close()
+            raise TimeoutError()
+        return original_run(coro, timeout=timeout)
+
+    monkeypatch.setattr(transport._loop_thread, "run", fake_run)
+
+    transport.close()
+
+    assert saw_disconnect
