@@ -1,4 +1,4 @@
-"""Direct serial IMU signal source for the live signal bench."""
+"""Fast direct IMU signal source for the live signal bench."""
 
 from __future__ import annotations
 
@@ -6,22 +6,21 @@ import math
 import threading
 import time
 from dataclasses import dataclass
-from typing import Protocol, cast
 
 import numpy as np
 import numpy.typing as npt
-import serial  # type: ignore[import-untyped]
 
 from vesc_py.buffer import VescBuffer
 from vesc_py.comm_ids import CommPacketId
+from vesc_py.connection import BlockingIo, VescConnection, build_imu_request, open_blocking_io
 from vesc_py.crc import crc16
-from vesc_py.imu import IMU_FIELDS, build_get_imu_data
+from vesc_py.imu import IMU_FIELDS
 from vesc_py.live_signal import (
     NSEC_PER_SEC,
     PendingSignalBuffer,
     SignalSourceSnapshot,
 )
-from vesc_py.packet import MAX_PACKET_LEN, encode_packet
+from vesc_py.packet import MAX_PACKET_LEN
 
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT = 0.1
@@ -59,20 +58,6 @@ _IMU_AXIS_UNITS = {
     "gyro_y": "deg/s",
     "gyro_z": "deg/s",
 }
-
-
-class SerialLike(Protocol):
-    """Small pyserial surface used by the IMU source."""
-
-    timeout: float | None
-
-    def read(self, size: int = 1) -> bytes: ...
-
-    def write(self, data: bytes) -> int | None: ...
-
-    def reset_input_buffer(self) -> None: ...
-
-    def close(self) -> None: ...
 
 
 @dataclass(slots=True)
@@ -142,7 +127,7 @@ def _field_value_index(mask: int, field_name: str) -> int | None:
     return preceding_fields.bit_count()
 
 
-def _read_exact(serial_port: SerialLike, size: int, deadline_ns: int) -> bytes | None:
+def _read_exact(serial_port: BlockingIo, size: int, deadline_ns: int) -> bytes | None:
     chunks = bytearray()
     while len(chunks) < size:
         remaining_ns = deadline_ns - time.perf_counter_ns()
@@ -159,7 +144,7 @@ def _read_exact(serial_port: SerialLike, size: int, deadline_ns: int) -> bytes |
 
 
 def _read_packet(
-    serial_port: SerialLike,
+    serial_port: BlockingIo,
     deadline_ns: int,
     stats: ImuSourceStats,
 ) -> bytes | None:
@@ -218,7 +203,7 @@ def _read_packet(
 
 
 def _read_expected_imu_packet(
-    serial_port: SerialLike,
+    serial_port: BlockingIo,
     packet_timeout: float,
     stats: ImuSourceStats,
 ) -> bytes | None:
@@ -232,72 +217,40 @@ def _read_expected_imu_packet(
         stats.unexpected_packets += 1
 
 
-def _open_serial(
-    port: str,
-    baudrate: int,
-    timeout: float,
-    exclusive: bool,
-) -> SerialLike:
-    kwargs = {
-        "port": port,
-        "baudrate": baudrate,
-        "bytesize": serial.EIGHTBITS,
-        "parity": serial.PARITY_NONE,
-        "stopbits": serial.STOPBITS_ONE,
-        "xonxoff": False,
-        "rtscts": False,
-        "dsrdtr": False,
-        "timeout": timeout,
-        "write_timeout": timeout,
-    }
-    try:
-        raw_serial = serial.Serial(**kwargs, exclusive=exclusive)
-    except TypeError:
-        raw_serial = serial.Serial(**kwargs)
-
-    serial_port = cast(SerialLike, raw_serial)
-    serial_port.reset_input_buffer()
-    return serial_port
-
-
 class VescImuSignalSource:
-    """SignalSource implementation backed by direct VESC USB serial IMU polling."""
+    """SignalSource implementation backed by direct VESC transport IMU polling."""
 
     def __init__(
         self,
         *,
-        port: str,
-        baudrate: int,
+        connection: VescConnection,
         axis: str,
         timeout: float,
         pipeline_depth: int,
         pending_samples: int,
-        exclusive: bool,
+        can_id: int | None = None,
     ) -> None:
-        if not port:
-            raise ValueError("port must not be empty")
-        if baudrate <= 0:
-            raise ValueError("baudrate must be greater than 0")
         if timeout <= 0.0:
             raise ValueError("timeout must be greater than 0")
         if pipeline_depth <= 0:
             raise ValueError("pipeline_depth must be greater than 0")
+        if can_id is not None and not 0 <= can_id <= 253:
+            raise ValueError("can_id must be in range 0..253")
 
-        self._port = port
-        self._baudrate = baudrate
+        self._connection = connection
         self._axis = parse_imu_axis(axis)
         self._timeout = timeout
         self._pipeline_depth = pipeline_depth
-        self._exclusive = exclusive
+        self._can_id = can_id
         self._mask = imu_axis_mask(self._axis)
-        self._request = encode_packet(build_get_imu_data(self._mask))
+        self._request = build_imu_request(self._mask, can_id=can_id)
         self._samples = PendingSignalBuffer(pending_samples)
         self._stats = ImuSourceStats()
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._done = threading.Event()
         self._thread: threading.Thread | None = None
-        self._serial_port: SerialLike | None = None
+        self._serial_port: BlockingIo | None = None
         self._start_ns = 0
         self._sample_count = 0
         self._dropped = 0
@@ -389,11 +342,9 @@ class VescImuSignalSource:
         pending_values: list[float] = []
         next_flush_ns = self._start_ns + 5_000_000
         try:
-            self._serial_port = _open_serial(
-                self._port,
-                self._baudrate,
-                self._timeout,
-                self._exclusive,
+            self._serial_port = open_blocking_io(
+                self._connection,
+                timeout=self._timeout,
             )
             while not self._stop.is_set():
                 serial_port = self._serial_port

@@ -24,6 +24,7 @@ import numpy as np
 import numpy.typing as npt
 
 from vesc_py import list_serial_ports
+from vesc_py.connection import VescConnection
 from vesc_py.fast_imu_source import (
     DEFAULT_BAUDRATE,
     DEFAULT_PIPELINE_DEPTH,
@@ -1370,13 +1371,15 @@ def make_source(args: argparse.Namespace) -> tuple[SignalSource, str]:
     port = cast(str | None, args.port) or autodetect_port()
     return (
         VescImuSignalSource(
-            port=port,
-            baudrate=cast(int, args.baudrate),
+            connection=VescConnection.serial(
+                port,
+                baudrate=cast(int, args.baudrate),
+                exclusive=not cast(bool, args.no_exclusive),
+            ),
             axis=axis,
             timeout=cast(float, args.timeout),
             pipeline_depth=cast(int, args.pipeline_depth),
             pending_samples=cast(int, args.pending_samples),
-            exclusive=not cast(bool, args.no_exclusive),
         ),
         f"VESC serial source: {port}",
     )

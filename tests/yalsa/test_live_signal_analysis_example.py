@@ -131,11 +131,6 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
         source_label=source_label,
         axis="acc_z",
         unit="g",
-        history=2_000,
-        max_points=500,
-        plot_rate_hz=25.0,
-        theme="dark",
-        antialias=False,
     )
 
     assert [parameter.name for parameter in app.parameters] == [
