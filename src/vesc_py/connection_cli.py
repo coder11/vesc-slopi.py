@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import curses
+import json
+import os
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, TextIO
 
 from vesc_py import ble_scan, list_serial_ports
@@ -81,6 +84,11 @@ def add_vesc_connection_arguments(
         metavar="BYTES",
         help="Maximum BLE Nordic UART write chunk size in bytes (default: %(default)s).",
     )
+    parser.add_argument(
+        "--force-discovery",
+        action="store_true",
+        help="Skip cached connection and force interactive discovery.",
+    )
     if include_can_id:
         parser.add_argument(
             "--can-id",
@@ -105,6 +113,7 @@ class _CanTargetCandidate:
 class _HasConnectionArgs(Protocol):
     serial: str | None
     ble: str | None
+    force_discovery: bool
     baudrate: int
     timeout: float
     no_exclusive: bool
@@ -134,6 +143,7 @@ def resolve_vesc_target_from_args(
         input_stream=input_stream,
         output_stream=output_stream,
     )
+    _save_cached_connection(connection)
     return VescTarget(connection=connection, can_id=can_id)
 
 
@@ -166,17 +176,34 @@ def _resolve_connection_from_args(
     output_stream: TextIO,
 ) -> VescConnection:
     if args.serial is not None:
-        return VescConnection.serial(
+        connection = VescConnection.serial(
             args.serial,
             baudrate=args.baudrate,
             exclusive=not args.no_exclusive,
         )
+        _save_cached_connection(connection)
+        return connection
     if args.ble is not None:
-        return VescConnection.ble(
+        connection = VescConnection.ble(
             args.ble,
             connect_timeout=args.ble_connect_timeout,
             chunk_size=args.ble_chunk_size,
         )
+        _save_cached_connection(connection)
+        return connection
+
+    if not args.force_discovery:
+        cached_connection = _load_cached_connection(args)
+        if cached_connection is not None and _can_connect(
+            cached_connection,
+            timeout=args.timeout,
+            output_stream=output_stream,
+        ):
+            print(
+                f"Using cached connection: {cached_connection.describe()}",
+                file=output_stream,
+            )
+            return cached_connection
 
     candidates = discover_connection_candidates(args, output_stream=output_stream)
     if not candidates:
@@ -300,6 +327,68 @@ def _resolve_can_target(
     finally:
         if client is not None:
             client.close()
+
+
+def _cache_file_path() -> Path:
+    state_dir = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+    return state_dir / "vescpy" / "connection.json"
+
+
+def _load_cached_connection(args: _HasConnectionArgs) -> VescConnection | None:
+    cache_file = _cache_file_path()
+    try:
+        payload = json.loads(cache_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    kind = payload.get("kind")
+    address = payload.get("address")
+    if not isinstance(kind, str) or not isinstance(address, str):
+        return None
+
+    if kind == "serial":
+        return VescConnection.serial(
+            address,
+            baudrate=args.baudrate,
+            exclusive=not args.no_exclusive,
+        )
+    if kind == "ble":
+        return VescConnection.ble(
+            address,
+            connect_timeout=args.ble_connect_timeout,
+            chunk_size=args.ble_chunk_size,
+        )
+    return None
+
+
+def _save_cached_connection(connection: VescConnection) -> None:
+    if connection.kind.value not in {"serial", "ble"}:
+        return
+    payload = {"kind": connection.kind.value, "address": connection.address}
+    cache_file = _cache_file_path()
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _can_connect(connection: VescConnection, *, timeout: float, output_stream: TextIO) -> bool:
+    client: VescClient | None = None
+    try:
+        client = connect_client(connection, timeout=timeout)
+    except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
+        print(
+            f"Cached connection failed ({connection.describe()}): {exc}. Falling back to discovery.",
+            file=output_stream,
+        )
+        return False
+    finally:
+        if client is not None:
+            client.close()
+    return True
 
 
 def _direct_can_candidate(fw: FwVersion | None) -> _CanTargetCandidate:

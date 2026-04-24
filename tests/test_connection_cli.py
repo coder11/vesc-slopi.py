@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
+from pathlib import Path
 
 import pytest
 
@@ -135,3 +137,120 @@ def test_resolve_target_rejects_multiple_connections_without_tty(
 
     with pytest.raises(SystemExit, match="Multiple VESC connections"):
         resolve_vesc_target_from_args(args, input_stream=io.StringIO(), output_stream=io.StringIO())
+
+
+def test_resolve_target_uses_cached_connection_before_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parser = _parser()
+    args = parser.parse_args(["--can-id", "9"])
+    state_dir = tmp_path / "state"
+    cache_dir = state_dir / "vescpy"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "connection.json").write_text(
+        json.dumps({"kind": "serial", "address": "/dev/cached"}),
+        encoding="utf-8",
+    )
+    output = io.StringIO()
+
+    class _Closable:
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+    monkeypatch.setattr("vesc_py.connection_cli.connect_client", lambda *args, **kwargs: _Closable())
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.list_serial_ports",
+        lambda: pytest.fail("Discovery should be skipped when cache succeeds"),
+    )
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.ble_scan",
+        lambda timeout: pytest.fail("Discovery should be skipped when cache succeeds"),
+    )
+
+    target = resolve_vesc_target_from_args(args, input_stream=io.StringIO(), output_stream=output)
+
+    assert target.connection.kind is VescConnectionKind.SERIAL
+    assert target.connection.address == "/dev/cached"
+    assert target.can_id == 9
+    assert "Using cached connection" in output.getvalue()
+
+
+def test_cached_connection_failure_falls_back_to_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parser = _parser()
+    args = parser.parse_args(["--can-id", "9"])
+    state_dir = tmp_path / "state"
+    cache_dir = state_dir / "vescpy"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "connection.json").write_text(
+        json.dumps({"kind": "serial", "address": "/dev/cached"}),
+        encoding="utf-8",
+    )
+    output = io.StringIO()
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.connect_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("boom")),
+    )
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.list_serial_ports",
+        lambda: [
+            VescSerialPort(
+                name="VESC - /dev/ttyACM0",
+                system_path="/dev/ttyACM0",
+                is_vesc=True,
+            )
+        ],
+    )
+    monkeypatch.setattr("vesc_py.connection_cli.ble_scan", lambda timeout: [])
+
+    target = resolve_vesc_target_from_args(args, input_stream=io.StringIO(), output_stream=output)
+
+    assert target.connection.kind is VescConnectionKind.SERIAL
+    assert target.connection.address == "/dev/ttyACM0"
+    assert target.can_id == 9
+    assert "Cached connection failed" in output.getvalue()
+
+
+def test_force_discovery_skips_cached_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    parser = _parser()
+    args = parser.parse_args(["--can-id", "9", "--force-discovery"])
+    state_dir = tmp_path / "state"
+    cache_dir = state_dir / "vescpy"
+    cache_dir.mkdir(parents=True)
+    (cache_dir / "connection.json").write_text(
+        json.dumps({"kind": "serial", "address": "/dev/cached"}),
+        encoding="utf-8",
+    )
+    output = io.StringIO()
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(state_dir))
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.connect_client",
+        lambda *args, **kwargs: pytest.fail("Cached connect probe should be skipped"),
+    )
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.list_serial_ports",
+        lambda: [
+            VescSerialPort(
+                name="VESC - /dev/ttyACM1",
+                system_path="/dev/ttyACM1",
+                is_vesc=True,
+            )
+        ],
+    )
+    monkeypatch.setattr("vesc_py.connection_cli.ble_scan", lambda timeout: [])
+
+    target = resolve_vesc_target_from_args(args, input_stream=io.StringIO(), output_stream=output)
+
+    assert target.connection.kind is VescConnectionKind.SERIAL
+    assert target.connection.address == "/dev/ttyACM1"
+    assert target.can_id == 9
