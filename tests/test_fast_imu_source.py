@@ -2,6 +2,7 @@ import math
 
 import pytest
 
+from vesc_py.connection import VescConnection
 from vesc_py.fast_imu_source import (
     VescImuSignalSource,
     imu_axis_display_value,
@@ -56,38 +57,32 @@ def test_imu_axis_display_value_leaves_accel_and_gyro_unchanged() -> None:
 
 def test_vesc_source_constructor_rejects_invalid_values() -> None:
     base = {
-        "port": "/dev/null",
-        "baudrate": 115200,
+        "connection": VescConnection.serial("/dev/null"),
         "axis": "acc_x",
         "timeout": 0.1,
         "pipeline_depth": 1,
         "pending_samples": 64,
-        "exclusive": True,
     }
 
-    with pytest.raises(ValueError, match="port"):
-        VescImuSignalSource(**{**base, "port": ""})
-    with pytest.raises(ValueError, match="baudrate"):
-        VescImuSignalSource(**{**base, "baudrate": 0})
     with pytest.raises(ValueError, match="axis"):
         VescImuSignalSource(**{**base, "axis": "bad"})
     with pytest.raises(ValueError, match="timeout"):
         VescImuSignalSource(**{**base, "timeout": 0.0})
     with pytest.raises(ValueError, match="pipeline_depth"):
         VescImuSignalSource(**{**base, "pipeline_depth": 0})
+    with pytest.raises(ValueError, match="can_id"):
+        VescImuSignalSource(**{**base, "can_id": 254})
     with pytest.raises(ValueError, match="capacity"):
         VescImuSignalSource(**{**base, "pending_samples": 0})
 
 
 def test_vesc_source_constructor_exposes_channel_and_unit_without_opening_serial() -> None:
     source = VescImuSignalSource(
-        port="/dev/null",
-        baudrate=115200,
+        connection=VescConnection.serial("/dev/null"),
         axis="gyro-z",
         timeout=0.1,
         pipeline_depth=1,
         pending_samples=64,
-        exclusive=True,
     )
 
     assert source.channel_name == "gyro_z"

@@ -25,17 +25,29 @@ from vesc_py.transport import Transport
 class SerialTransport(Transport):
     """pyserial transport at 115200 8N1, no flow control."""
 
-    def __init__(self, port: str, baudrate: int = 115200) -> None:
-        self._ser = serial.Serial(
-            port=port,
-            baudrate=baudrate,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            xonxoff=False,
-            rtscts=False,
-            timeout=0.1,
-        )
+    def __init__(
+        self,
+        port: str,
+        baudrate: int = 115200,
+        *,
+        timeout: float = 0.1,
+        exclusive: bool = True,
+    ) -> None:
+        kwargs = {
+            "port": port,
+            "baudrate": baudrate,
+            "bytesize": serial.EIGHTBITS,
+            "parity": serial.PARITY_NONE,
+            "stopbits": serial.STOPBITS_ONE,
+            "xonxoff": False,
+            "rtscts": False,
+            "timeout": timeout,
+            "write_timeout": timeout,
+        }
+        try:
+            self._ser = serial.Serial(**kwargs, exclusive=exclusive)
+        except TypeError:
+            self._ser = serial.Serial(**kwargs)
 
     def send(self, data: bytes) -> None:
         self._ser.write(data)
