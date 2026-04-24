@@ -1,96 +1,101 @@
-import argparse
-import math
-from types import SimpleNamespace
+from __future__ import annotations
 
-import numpy as np
+from io import StringIO
+from unittest.mock import ANY
+
 import pytest
 
 from examples.poll_imu_fast import (
-    AxisPlotHistory,
-    AxisSampleBuffer,
-    build_imu_request,
-    build_parser,
+    DEFAULT_MASK,
+    DEFAULT_PIPELINE_DEPTH,
+    DEFAULT_TIMEOUT,
     HOST_RX_TIMING_NOTICE,
-    HOST_RX_TIMESTAMP_SOURCE,
-    IMU_PLOT_CHANNELS,
-    ImuPlotHistory,
-    ImuSampleBuffer,
     ParsedImu,
-    axis_frequency_spectrum,
-    field_value_index,
-    imu_frequency_spectrum,
+    TerminalImuDisplay,
+    field_names_for_mask,
+    main,
     open_poll_connection,
-    parse_accel_axis_arg,
-    scan_and_print_ble,
-    write_csv_header,
-    write_sample,
+    parse_imu_payload,
+    poll_imu,
 )
+from vesc_py.buffer import VescBuffer
 from vesc_py.comm_ids import CommPacketId
 from vesc_py.connection import VescConnection, VescTarget
 from vesc_py.packet import encode_packet
 
 
-def test_field_value_index_matches_compacted_response_values() -> None:
-    mask = 0x0038
-
-    assert field_value_index(mask, "acc_x") == 0
-    assert field_value_index(mask, "acc_y") == 1
-    assert field_value_index(mask, "acc_z") == 2
-    assert field_value_index(mask, "gyro_x") is None
-
-
-def test_parse_accel_axis_accepts_short_and_field_names() -> None:
-    assert parse_accel_axis_arg("x") == "acc_x"
-    assert parse_accel_axis_arg("accel-z") == "acc_z"
-
-    with pytest.raises(argparse.ArgumentTypeError):
-        parse_accel_axis_arg("roll")
+def _imu_payload(mask: int, values: tuple[float, ...], *, vesc_id: int | None = None) -> bytes:
+    buffer = VescBuffer()
+    buffer.append_uint8(CommPacketId.COMM_GET_IMU_DATA)
+    buffer.append_uint16(mask)
+    for value in values:
+        buffer.append_double32_auto(value)
+    if vesc_id is not None:
+        buffer.append_uint8(vesc_id)
+    return buffer.to_bytes()
 
 
-def test_parser_accepts_ble_connection_options() -> None:
-    parser = build_parser()
+class _FakePollIo:
+    def __init__(self, packet: bytes) -> None:
+        self.timeout: float | None = None
+        self._buffer = bytearray(packet)
+        self.requests: list[bytes] = []
+        self.closed = False
 
-    args = parser.parse_args(
-        [
-            "--ble",
-            "AA:BB:CC:DD:EE:FF",
-            "--timeout",
-            "1.5",
-            "--ble-connect-timeout",
-            "2.5",
-            "--ble-chunk-size",
-            "64",
-        ]
-    )
+    def read(self, size: int = 1) -> bytes:
+        if not self._buffer:
+            return b""
+        chunk = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return chunk
 
-    assert args.ble == "AA:BB:CC:DD:EE:FF"
-    assert args.timeout == pytest.approx(1.5)
-    assert args.ble_connect_timeout == pytest.approx(2.5)
-    assert args.ble_chunk_size == 64
+    def write(self, data: bytes) -> int:
+        self.requests.append(data)
+        return len(data)
 
+    def reset_input_buffer(self) -> None:
+        self._buffer.clear()
 
-def test_parser_accepts_can_id() -> None:
-    parser = build_parser()
-
-    args = parser.parse_args(["--ble", "AA:BB:CC:DD:EE:FF", "--can-id", "7"])
-
-    assert args.can_id == 7
+    def close(self) -> None:
+        self.closed = True
 
 
-def test_build_imu_request_wraps_can_forwarding() -> None:
-    request = build_imu_request(0x01FF, can_id=7)
+class _FakeTui:
+    def __init__(self) -> None:
+        self.started = False
+        self.closed = False
+        self.render_calls: list[dict[str, object]] = []
 
-    assert request == encode_packet(
-        bytes(
-            [
-                CommPacketId.COMM_FORWARD_CAN,
-                7,
-                CommPacketId.COMM_GET_IMU_DATA,
-                0x01,
-                0xFF,
-            ]
-        )
-    )
+    def start(self) -> None:
+        self.started = True
+
+    def due(self, now_ns: int) -> bool:
+        return True
+
+    def render(self, **kwargs: object) -> None:
+        self.render_calls.append(kwargs)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _TtyStringIO(StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def test_field_names_for_mask_returns_wire_order() -> None:
+    assert field_names_for_mask(0x0038) == ("acc_x", "acc_y", "acc_z")
+
+
+def test_parse_imu_payload_decodes_selected_fields_and_vesc_id() -> None:
+    payload = _imu_payload(0x0009, (1.25, -0.5), vesc_id=7)
+
+    parsed = parse_imu_payload(payload)
+
+    assert parsed.mask == 0x0009
+    assert parsed.values == pytest.approx((1.25, -0.5))
+    assert parsed.vesc_id == 7
 
 
 def test_open_poll_connection_uses_ble_options(
@@ -123,194 +128,126 @@ def test_open_poll_connection_uses_ble_options(
     }
 
 
-def test_scan_and_print_ble_lists_discovered_devices(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    parser = build_parser()
-    args = parser.parse_args(["--scan-ble", "--ble-scan-timeout", "0.25"])
+def test_terminal_imu_display_renders_status_block() -> None:
+    stream = StringIO()
+    display = TerminalImuDisplay(refresh_hz=10.0, stream=stream)
+    parsed = ParsedImu(mask=0x0001, values=(1.25,), vesc_id=69)
 
-    def fake_discover_connection_candidates(
-        parsed_args: argparse.Namespace,
-        *,
-        output_stream: object,
-    ) -> list[SimpleNamespace]:
-        assert parsed_args is args
-        return [
-            SimpleNamespace(
-                connection=VescConnection.serial("/dev/ttyACM0"),
-                label="Serial [vesc]: /dev/ttyACM0",
-            ),
-            SimpleNamespace(
-                connection=VescConnection.ble("AA:BB:CC:DD:EE:FF"),
-                label="BLE: VESC BLE | AA:BB:CC:DD:EE:FF | RSSI -51 dBm",
-            ),
-            SimpleNamespace(
-                connection=VescConnection.ble("11:22:33:44:55:66"),
-                label="BLE: (unnamed) | 11:22:33:44:55:66",
-            ),
-        ]
-
-    monkeypatch.setattr(
-        "examples.poll_imu_fast.discover_connection_candidates",
-        fake_discover_connection_candidates,
-    )
-
-    scan_and_print_ble(args)
-
-    output = capsys.readouterr().out
-    assert "Scanning for VESC BLE devices for 0.25s ..." in output
-    assert "BLE: VESC BLE | AA:BB:CC:DD:EE:FF | RSSI -51 dBm" in output
-    assert "BLE: (unnamed) | 11:22:33:44:55:66" in output
-
-
-def test_csv_header_labels_host_receive_timing(capsys: pytest.CaptureFixture[str]) -> None:
-    write_csv_header(0x0038)
-
-    assert capsys.readouterr().out == (
-        "host_rx_time_s,host_rx_dt_s,vesc_id,rx_mask,acc_x,acc_y,acc_z\n"
-    )
-
-
-def test_human_sample_output_labels_host_receive_timing(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    parsed = ParsedImu(mask=0x0001, values=(1.25,), vesc_id=None)
-
-    write_sample(
-        2,
-        timestamp_ns=1_250_000_000,
+    display.start()
+    display.render(
+        now_ns=2_000_000_000,
         start_ns=1_000_000_000,
-        previous_ns=1_200_000_000,
+        sample_timestamp_ns=2_000_000_000,
         parsed=parsed,
-        csv=False,
+        poll_stats=type("PollStatsObj", (), {"samples": 10, "requests": 10, "timeouts": 0, "parse_errors": 0})(),
+        reader_stats=type(
+            "ReaderStatsObj",
+            (),
+            {
+                "bad_crc": 0,
+                "bad_stop": 0,
+                "discarded_bytes": 0,
+                "unexpected_packets": 0,
+            },
+        )(),
+        current_rate=1234.5,
+        average_rate=1200.0,
     )
 
-    output = capsys.readouterr().out
-    assert "host_rx_t=0.250000s" in output
-    assert "host_rx_dt=0.050000000" in output
-    assert "sample=2 t=" not in output
+    rendered = stream.getvalue()
+    assert "VESC IMU fast poller" in rendered
+    assert "timing: host_rx_after_packet   sample_age: 0.00 ms" in rendered
+    assert "vesc_id: 69   rx_mask: 0x0001" in rendered
+    assert "IMU values" in rendered
+    assert "roll                 1.25" in rendered
 
 
-def test_timestamp_source_documents_receive_completion() -> None:
-    assert HOST_RX_TIMESTAMP_SOURCE == "host_rx_after_packet"
-    assert "configured IMU sample rate" in HOST_RX_TIMING_NOTICE
-    assert "latest cached values" in HOST_RX_TIMING_NOTICE
-    assert "sample timestamps or sample indexes" in HOST_RX_TIMING_NOTICE
+def test_poll_imu_renders_via_tui() -> None:
+    payload = _imu_payload(0x0001, (1.25,), vesc_id=3)
+    packet = encode_packet(payload)
+    serial_port = _FakePollIo(packet)
+    status_stream = StringIO()
+    tui = _FakeTui()
 
-
-def test_axis_sample_buffer_drains_in_order_after_overwrite() -> None:
-    buffer = AxisSampleBuffer(3)
-
-    for index in range(5):
-        buffer.append(float(index), float(index + 10))
-
-    timestamps, values, dropped = buffer.drain()
-
-    assert timestamps.tolist() == [2.0, 3.0, 4.0]
-    assert values.tolist() == [12.0, 13.0, 14.0]
-    assert dropped == 2
-
-
-def test_axis_sample_buffer_appends_batch_with_one_overwrite_window() -> None:
-    buffer = AxisSampleBuffer(4)
-
-    buffer.append(0.0, 10.0)
-    buffer.append_many((1.0, 2.0, 3.0, 4.0), (11.0, 12.0, 13.0, 14.0))
-    timestamps, values, dropped = buffer.drain()
-
-    assert timestamps.tolist() == [1.0, 2.0, 3.0, 4.0]
-    assert values.tolist() == [11.0, 12.0, 13.0, 14.0]
-    assert dropped == 1
-
-
-def test_imu_sample_buffer_drains_channel_matrix_in_order() -> None:
-    buffer = ImuSampleBuffer(3)
-    values = [
-        tuple(float(index + channel) for channel in range(IMU_PLOT_CHANNELS))
-        for index in range(5)
-    ]
-
-    buffer.append_many(tuple(float(index) for index in range(5)), values)
-    timestamps, drained_values, dropped = buffer.drain()
-
-    assert timestamps.tolist() == [2.0, 3.0, 4.0]
-    assert drained_values.shape == (IMU_PLOT_CHANNELS, 3)
-    assert drained_values[0].tolist() == [2.0, 3.0, 4.0]
-    assert drained_values[8].tolist() == [10.0, 11.0, 12.0]
-    assert dropped == 2
-
-
-def test_axis_plot_history_keeps_latest_fixed_width_samples() -> None:
-    history = AxisPlotHistory(3)
-
-    history.append_samples(
-        np.array([0.0, 1.0], dtype=np.float64),
-        np.array([10.0, 11.0], dtype=np.float64),
-    )
-    history.append_samples(
-        np.array([2.0, 3.0], dtype=np.float64),
-        np.array([12.0, 13.0], dtype=np.float64),
+    poll_imu(
+        serial_port,
+        request=b"imu-request",
+        packet_timeout=1.0,
+        pipeline_depth=1,
+        status_stream=status_stream,
+        tui=tui,
+        max_samples=1,
     )
 
-    assert history.count == 3
-    assert history.latest_timestamp == 3.0
-    assert history.valid_timestamps().tolist() == [1.0, 2.0, 3.0]
-    assert history.valid_values().tolist() == [11.0, 12.0, 13.0]
-    assert history.sample_hz() == pytest.approx(1.0)
+    assert serial_port.requests == [b"imu-request"]
+    assert tui.started is True
+    assert len(tui.render_calls) == 1
+    assert tui.render_calls[0]["parsed"] == ParsedImu(mask=0x0001, values=(1.25,), vesc_id=3)
+    assert tui.closed is True
+    assert "Done. samples=1 requests=1" in status_stream.getvalue()
 
 
-def test_imu_plot_history_keeps_latest_channel_matrix() -> None:
-    history = ImuPlotHistory(3)
-    first_values = np.vstack(
-        [
-            np.array([float(channel), float(channel + 10)], dtype=np.float64)
-            for channel in range(IMU_PLOT_CHANNELS)
-        ]
+def test_main_uses_shared_connection_cli_and_fixed_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    target = VescTarget(VescConnection.serial("/dev/ttyACM0"))
+    serial_port = _FakePollIo(b"")
+    stderr_stream = _TtyStringIO()
+
+    def fake_run_vesc_connection_cli(argv: object) -> VescTarget:
+        calls["argv"] = tuple(argv) if argv is not None else None
+        return target
+
+    def fake_build_imu_request(mask: int, can_id: int | None = None) -> bytes:
+        calls["request_args"] = (mask, can_id)
+        return b"imu-request"
+
+    def fake_open_poll_connection(
+        resolved_target: VescTarget,
+        *,
+        timeout: float,
+    ) -> tuple[_FakePollIo, str]:
+        calls["open_target"] = resolved_target
+        calls["open_timeout"] = timeout
+        return serial_port, "/dev/ttyACM0"
+
+    def fake_poll_imu(
+        resolved_serial_port: _FakePollIo,
+        *,
+        request: bytes,
+        packet_timeout: float,
+        pipeline_depth: int,
+        tui: object | None = None,
+        **_: object,
+    ) -> None:
+        calls["poll_args"] = (
+            resolved_serial_port,
+            request,
+            packet_timeout,
+            pipeline_depth,
+            tui,
+        )
+
+    monkeypatch.setattr("examples.poll_imu_fast.run_vesc_connection_cli", fake_run_vesc_connection_cli)
+    monkeypatch.setattr("examples.poll_imu_fast.build_imu_request", fake_build_imu_request)
+    monkeypatch.setattr("examples.poll_imu_fast.open_poll_connection", fake_open_poll_connection)
+    monkeypatch.setattr("examples.poll_imu_fast.poll_imu", fake_poll_imu)
+    monkeypatch.setattr("examples.poll_imu_fast.sys.stderr", stderr_stream)
+
+    main(["--serial", "/dev/ttyACM0"])
+
+    assert calls["argv"] == ("--serial", "/dev/ttyACM0")
+    assert calls["request_args"] == (DEFAULT_MASK, None)
+    assert calls["open_target"] == target
+    assert calls["open_timeout"] == DEFAULT_TIMEOUT
+    assert calls["poll_args"] == (
+        serial_port,
+        b"imu-request",
+        DEFAULT_TIMEOUT,
+        DEFAULT_PIPELINE_DEPTH,
+        ANY,
     )
-    second_values = np.vstack(
-        [
-            np.array([float(channel + 20), float(channel + 30)], dtype=np.float64)
-            for channel in range(IMU_PLOT_CHANNELS)
-        ]
-    )
-
-    history.append_samples(np.array([0.0, 1.0], dtype=np.float64), first_values)
-    history.append_samples(np.array([2.0, 3.0], dtype=np.float64), second_values)
-
-    assert history.count == 3
-    assert history.latest_timestamp == 3.0
-    assert history.valid_timestamps().tolist() == [1.0, 2.0, 3.0]
-    assert history.valid_values()[0].tolist() == [10.0, 20.0, 30.0]
-    assert history.valid_values()[8].tolist() == [18.0, 28.0, 38.0]
-
-
-def test_axis_frequency_spectrum_uses_recent_time_window() -> None:
-    timestamps = np.arange(0.0, 4.0, 0.01, dtype=np.float64)
-    values = np.sin(2.0 * math.pi * 5.0 * timestamps)
-
-    spectrum = axis_frequency_spectrum(timestamps, values, window_s=2.0)
-
-    assert spectrum is not None
-    frequencies, magnitudes, nyquist_hz, sample_count = spectrum
-    peak_index = int(np.argmax(magnitudes[1:]) + 1)
-
-    assert sample_count == 200
-    assert frequencies[peak_index] == pytest.approx(5.0, abs=0.1)
-    assert nyquist_hz == pytest.approx(50.0)
-
-
-def test_imu_frequency_spectrum_finds_channel_peak() -> None:
-    timestamps = np.arange(0.0, 4.0, 0.01, dtype=np.float64)
-    values = np.zeros((IMU_PLOT_CHANNELS, timestamps.size), dtype=np.float64)
-    values[3] = np.sin(2.0 * math.pi * 7.0 * timestamps)
-
-    spectrum = imu_frequency_spectrum(timestamps, values, window_s=2.0)
-
-    assert spectrum is not None
-    frequencies, magnitudes, nyquist_hz, sample_count = spectrum
-    peak_index = int(np.argmax(magnitudes[3, 1:]) + 1)
-
-    assert sample_count == 200
-    assert frequencies[peak_index] == pytest.approx(7.0, abs=0.1)
-    assert nyquist_hz == pytest.approx(50.0)
+    assert serial_port.closed is True
+    assert "display=tui" in stderr_stream.getvalue()
+    assert HOST_RX_TIMING_NOTICE in stderr_stream.getvalue()
