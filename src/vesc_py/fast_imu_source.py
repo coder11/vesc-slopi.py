@@ -62,6 +62,7 @@ _IMU_AXIS_UNITS = {
     "gyro_y": "deg/s",
     "gyro_z": "deg/s",
 }
+_RATE_LIMIT_SLEEP_SLACK_NS = 200_000
 
 
 @dataclass(slots=True)
@@ -221,6 +222,17 @@ def _read_expected_imu_packet(
         stats.unexpected_packets += 1
 
 
+def _wait_until_ns(deadline_ns: int, stop: threading.Event) -> bool:
+    while not stop.is_set():
+        remaining_ns = deadline_ns - time.perf_counter_ns()
+        if remaining_ns <= 0:
+            return True
+        if remaining_ns > _RATE_LIMIT_SLEEP_SLACK_NS:
+            sleep_s = (remaining_ns - _RATE_LIMIT_SLEEP_SLACK_NS) / NSEC_PER_SEC
+            time.sleep(min(sleep_s, 0.01))
+    return False
+
+
 class VescImuSignalSource:
     """SignalSource implementation backed by direct VESC transport IMU polling."""
 
@@ -231,16 +243,25 @@ class VescImuSignalSource:
         axis: str,
         timeout: float,
         pending_samples: int,
+        poll_rate_hz: float | None = None,
         can_id: int | None = None,
     ) -> None:
         if timeout <= 0.0:
             raise ValueError("timeout must be greater than 0")
+        if poll_rate_hz is not None and poll_rate_hz <= 0.0:
+            raise ValueError("poll_rate_hz must be greater than 0")
         if can_id is not None and not 0 <= can_id <= 253:
             raise ValueError("can_id must be in range 0..253")
 
         self._connection = connection
         self._axis = parse_imu_axis(axis)
         self._timeout = timeout
+        self._poll_rate_hz = poll_rate_hz
+        self._poll_interval_ns = (
+            None
+            if poll_rate_hz is None
+            else max(1, round(NSEC_PER_SEC / poll_rate_hz))
+        )
         self._can_id = can_id
         self._mask = imu_axis_mask(self._axis)
         self._request = build_imu_request(self._mask, can_id=can_id)
@@ -340,6 +361,7 @@ class VescImuSignalSource:
         pending_timestamps: list[float] = []
         pending_values: list[float] = []
         next_flush_ns = self._start_ns + 5_000_000
+        previous_request_ns: int | None = None
         try:
             self._serial_port = open_blocking_io(
                 self._connection,
@@ -350,6 +372,15 @@ class VescImuSignalSource:
                 if serial_port is None:
                     break
 
+                if (
+                    self._poll_interval_ns is not None
+                    and previous_request_ns is not None
+                ):
+                    next_request_ns = previous_request_ns + self._poll_interval_ns
+                    if not _wait_until_ns(next_request_ns, self._stop):
+                        break
+
+                previous_request_ns = time.perf_counter_ns()
                 serial_port.write(self._request)
 
                 payload = _read_expected_imu_packet(

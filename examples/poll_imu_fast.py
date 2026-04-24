@@ -21,6 +21,7 @@ Examples:
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from collections.abc import Sequence
@@ -35,7 +36,10 @@ from vesc_py.connection import (
     build_imu_request,
     open_blocking_io,
 )
-from vesc_py.connection_cli import run_vesc_connection_cli
+from vesc_py.connection_cli import (
+    add_vesc_connection_arguments,
+    resolve_vesc_target_from_args,
+)
 from vesc_py.crc import crc16
 from vesc_py.imu import IMU_FIELDS
 from vesc_py.packet import MAX_PACKET_LEN
@@ -45,6 +49,7 @@ DEFAULT_TIMEOUT = 0.1
 DEFAULT_STATUS_INTERVAL = 1.0
 DEFAULT_UI_RATE = 10.0
 NSEC_PER_SEC = 1_000_000_000
+RATE_LIMIT_SLEEP_SLACK_NS = 200_000
 HOST_RX_TIMESTAMP_SOURCE = "host_rx_after_packet"
 HOST_RX_TIMING_NOTICE = (
     "Firmware samples IMU data at the configured IMU sample rate, but "
@@ -356,31 +361,76 @@ def format_values(mask: int, values: tuple[float, ...], max_fields: int = 9) -> 
     return " ".join(parts)
 
 
+def build_parser() -> argparse.ArgumentParser:
+    """Create CLI parser for shared connection flags plus fast-poll settings."""
+    parser = argparse.ArgumentParser(
+        description="Poll VESC IMU data in a terminal TUI.",
+    )
+    add_vesc_connection_arguments(parser)
+    parser.add_argument(
+        "--poll-rate",
+        type=float,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Cap request rate in Hz. "
+            "When omitted, polling runs as fast as responses arrive."
+        ),
+    )
+    return parser
+
+
+def wait_until_ns(deadline_ns: int) -> None:
+    """Wait until *deadline_ns* using coarse sleep plus a short busy-spin."""
+    while True:
+        remaining_ns = deadline_ns - time.perf_counter_ns()
+        if remaining_ns <= 0:
+            return
+        if remaining_ns > RATE_LIMIT_SLEEP_SLACK_NS:
+            sleep_s = (remaining_ns - RATE_LIMIT_SLEEP_SLACK_NS) / NSEC_PER_SEC
+            time.sleep(min(sleep_s, 0.01))
+
+
 def poll_imu(
     serial_port: PollIo,
     *,
     request: bytes,
     packet_timeout: float,
+    poll_rate_hz: float | None = None,
     status_stream: TextIO = sys.stderr,
     status_interval: float = DEFAULT_STATUS_INTERVAL,
     tui: TerminalImuDisplay | None = None,
     max_samples: int = 0,
 ) -> None:
     """Run the high-rate IMU polling loop."""
+    if poll_rate_hz is not None and poll_rate_hz <= 0.0:
+        raise ValueError("poll_rate_hz must be greater than 0")
+
     reader_stats = ReaderStats()
     poll_stats = PollStats()
     start_ns = time.perf_counter_ns()
     previous_sample_ns: int | None = None
+    previous_request_ns: int | None = None
     next_status_ns = start_ns + round(status_interval * NSEC_PER_SEC)
     status_window_ns = start_ns
     status_window_samples = 0
     latest: ParsedImu | None = None
+    poll_interval_ns = (
+        None
+        if poll_rate_hz is None
+        else max(1, round(NSEC_PER_SEC / poll_rate_hz))
+    )
 
     if tui is not None:
         tui.start()
 
     try:
         while max_samples <= 0 or poll_stats.samples < max_samples:
+            if poll_interval_ns is not None and previous_request_ns is not None:
+                next_request_ns = previous_request_ns + poll_interval_ns
+                wait_until_ns(next_request_ns)
+
+            previous_request_ns = time.perf_counter_ns()
             serial_port.write(request)
             poll_stats.requests += 1
 
@@ -468,7 +518,12 @@ def poll_imu(
 
 def main(argv: Sequence[str] | None = None) -> None:
     """CLI entrypoint."""
-    target = run_vesc_connection_cli(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.poll_rate is not None and args.poll_rate <= 0.0:
+        parser.error("--poll-rate must be greater than 0")
+
+    target = resolve_vesc_target_from_args(args)
 
     request = build_imu_request(DEFAULT_MASK, can_id=target.can_id)
     fields = ", ".join(field_names_for_mask(DEFAULT_MASK))
@@ -492,7 +547,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print(
         f"Opening {link_label}; mask=0x{DEFAULT_MASK:04x} ({fields}); "
-        f"display={display}{target_label}",
+        f"display={display}; poll_rate="
+        f"{'max' if args.poll_rate is None else f'<= {args.poll_rate:g} Hz'}"
+        f"{target_label}",
         file=sys.stderr,
     )
     print(HOST_RX_TIMING_NOTICE, file=sys.stderr)
@@ -502,6 +559,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             serial_port,
             request=request,
             packet_timeout=DEFAULT_TIMEOUT,
+            poll_rate_hz=cast(float | None, args.poll_rate),
             tui=tui,
         )
     finally:

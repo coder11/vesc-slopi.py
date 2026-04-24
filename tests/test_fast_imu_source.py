@@ -1,4 +1,5 @@
 import math
+import time
 
 import pytest
 
@@ -67,6 +68,8 @@ def test_vesc_source_constructor_rejects_invalid_values() -> None:
         VescImuSignalSource(**{**base, "axis": "bad"})
     with pytest.raises(ValueError, match="timeout"):
         VescImuSignalSource(**{**base, "timeout": 0.0})
+    with pytest.raises(ValueError, match="poll_rate_hz"):
+        VescImuSignalSource(**{**base, "poll_rate_hz": 0.0})
     with pytest.raises(ValueError, match="can_id"):
         VescImuSignalSource(**{**base, "can_id": 254})
     with pytest.raises(ValueError, match="capacity"):
@@ -83,3 +86,64 @@ def test_vesc_source_constructor_exposes_channel_and_unit_without_opening_serial
 
     assert source.channel_name == "gyro_z"
     assert source.unit == "deg/s"
+
+
+def test_vesc_source_run_caps_poll_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write_times: list[float] = []
+
+    class FakeSerial:
+        timeout = 0.0
+
+        def write(self, _data: bytes) -> None:
+            write_times.append(time.perf_counter())
+
+        def read(self, _size: int) -> bytes:
+            return b""
+
+        def reset_input_buffer(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    fake_serial = FakeSerial()
+    source = VescImuSignalSource(
+        connection=VescConnection.serial("/dev/null"),
+        axis="acc_x",
+        timeout=0.1,
+        pending_samples=64,
+        poll_rate_hz=20.0,
+    )
+
+    def fake_open_blocking_io(connection: VescConnection, *, timeout: float) -> FakeSerial:
+        assert connection == VescConnection.serial("/dev/null")
+        assert timeout == pytest.approx(0.1)
+        return fake_serial
+
+    def fake_read_expected_imu_packet(
+        serial_port: FakeSerial,
+        packet_timeout: float,
+        stats: object,
+    ) -> bytes:
+        assert serial_port is fake_serial
+        assert packet_timeout == pytest.approx(0.1)
+        assert stats is not None
+        if len(write_times) >= 3:
+            source._stop.set()
+        return b"payload"
+
+    monkeypatch.setattr("vesc_py.fast_imu_source.open_blocking_io", fake_open_blocking_io)
+    monkeypatch.setattr(
+        "vesc_py.fast_imu_source._read_expected_imu_packet",
+        fake_read_expected_imu_packet,
+    )
+    monkeypatch.setattr(source, "_value_from_payload", lambda _payload: 1.25)
+
+    source._run()
+
+    assert len(write_times) == 3
+    intervals = [later - earlier for earlier, later in zip(write_times, write_times[1:])]
+    assert intervals[0] >= 0.045
+    assert intervals[1] >= 0.045

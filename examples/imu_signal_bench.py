@@ -1181,6 +1181,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Per-response timeout for --source vesc (default: {DEFAULT_TIMEOUT:g}).",
     )
     parser.add_argument(
+        "--poll-rate",
+        type=float,
+        default=None,
+        metavar="HZ",
+        help=(
+            "Cap --source vesc request rate in Hz. "
+            "When omitted, the source polls as fast as responses arrive."
+        ),
+    )
+    parser.add_argument(
         "--axis",
         type=parse_axis_arg,
         default="acc_x",
@@ -1300,6 +1310,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--baudrate must be greater than 0")
     if args.timeout <= 0.0:
         parser.error("--timeout must be greater than 0")
+    if args.poll_rate is not None and args.poll_rate <= 0.0:
+        parser.error("--poll-rate must be greater than 0")
     if args.filter_cutoff_hz <= 0.0:
         parser.error("--filter-cutoff-hz must be greater than 0")
     if args.biquad_shape <= 0.0:
@@ -1365,8 +1377,13 @@ def make_source(args: argparse.Namespace) -> tuple[SignalSource, str]:
             axis=axis,
             timeout=cast(float, args.timeout),
             pending_samples=cast(int, args.pending_samples),
+            poll_rate_hz=cast(float | None, args.poll_rate),
         ),
-        f"VESC serial source: {port}",
+        (
+            f"VESC serial source: {port}"
+            if args.poll_rate is None
+            else f"VESC serial source: {port} @ <= {args.poll_rate:g} Hz"
+        ),
     )
 
 

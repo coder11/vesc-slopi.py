@@ -330,3 +330,49 @@ def test_deterministic_white_noise_source_uses_configured_rate() -> None:
     assert source.channel_name == "gyro_z"
     assert source.unit == "deg/s"
     assert source_label == "Deterministic white noise source @ 321 Hz"
+
+
+def test_validate_args_rejects_non_positive_poll_rate() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--poll-rate", "0"])
+
+    with pytest.raises(SystemExit):
+        validate_args(parser, args)
+
+
+def test_make_source_passes_poll_rate_to_vesc_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--source",
+            "vesc",
+            "--axis",
+            "gyro_z",
+            "--port",
+            "/dev/ttyUSB0",
+            "--poll-rate",
+            "250",
+        ]
+    )
+    calls: dict[str, object] = {}
+
+    class FakeSource:
+        channel_name = "gyro_z"
+        unit = "deg/s"
+
+        def __init__(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+
+    monkeypatch.setattr("examples.imu_signal_bench.VescImuSignalSource", FakeSource)
+
+    validate_args(parser, args)
+    source, source_label = make_source(args)
+
+    assert isinstance(source, FakeSource)
+    assert calls["axis"] == "gyro_z"
+    assert calls["timeout"] == pytest.approx(0.1)
+    assert calls["pending_samples"] == 20_000
+    assert calls["poll_rate_hz"] == pytest.approx(250.0)
+    assert source_label == "VESC serial source: /dev/ttyUSB0 @ <= 250 Hz"

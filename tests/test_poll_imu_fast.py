@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import StringIO
+import time
 from unittest.mock import ANY
 
 import pytest
@@ -11,6 +12,7 @@ from examples.poll_imu_fast import (
     HOST_RX_TIMING_NOTICE,
     ParsedImu,
     TerminalImuDisplay,
+    build_parser,
     field_names_for_mask,
     main,
     open_poll_connection,
@@ -185,6 +187,34 @@ def test_poll_imu_renders_via_tui() -> None:
     assert "Done. samples=1 requests=1" in status_stream.getvalue()
 
 
+def test_poll_imu_caps_request_rate() -> None:
+    serial_port = _FakePollIo(b"")
+    status_stream = StringIO()
+    request_times: list[float] = []
+
+    def write_with_timestamp(data: bytes) -> int:
+        request_times.append(time.perf_counter())
+        if len(request_times) >= 3:
+            raise KeyboardInterrupt
+        serial_port.requests.append(data)
+        return len(data)
+
+    serial_port.write = write_with_timestamp  # type: ignore[method-assign]
+
+    poll_imu(
+        serial_port,
+        request=b"imu-request",
+        packet_timeout=1.0,
+        poll_rate_hz=20.0,
+        status_stream=status_stream,
+    )
+
+    assert len(request_times) == 3
+    intervals = [later - earlier for earlier, later in zip(request_times, request_times[1:])]
+    assert intervals[0] >= 0.045
+    assert intervals[1] >= 0.045
+
+
 def test_main_uses_shared_connection_cli_and_fixed_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -193,8 +223,11 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
     serial_port = _FakePollIo(b"")
     stderr_stream = _TtyStringIO()
 
-    def fake_run_vesc_connection_cli(argv: object) -> VescTarget:
-        calls["argv"] = tuple(argv) if argv is not None else None
+    def fake_resolve_vesc_target_from_args(args: object) -> VescTarget:
+        calls["argv"] = (
+            getattr(args, "serial", None),
+            getattr(args, "poll_rate", None),
+        )
         return target
 
     def fake_build_imu_request(mask: int, can_id: int | None = None) -> bytes:
@@ -215,6 +248,7 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
         *,
         request: bytes,
         packet_timeout: float,
+        poll_rate_hz: float | None = None,
         tui: object | None = None,
         **_: object,
     ) -> None:
@@ -222,18 +256,22 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
             resolved_serial_port,
             request,
             packet_timeout,
+            poll_rate_hz,
             tui,
         )
 
-    monkeypatch.setattr("examples.poll_imu_fast.run_vesc_connection_cli", fake_run_vesc_connection_cli)
+    monkeypatch.setattr(
+        "examples.poll_imu_fast.resolve_vesc_target_from_args",
+        fake_resolve_vesc_target_from_args,
+    )
     monkeypatch.setattr("examples.poll_imu_fast.build_imu_request", fake_build_imu_request)
     monkeypatch.setattr("examples.poll_imu_fast.open_poll_connection", fake_open_poll_connection)
     monkeypatch.setattr("examples.poll_imu_fast.poll_imu", fake_poll_imu)
     monkeypatch.setattr("examples.poll_imu_fast.sys.stderr", stderr_stream)
 
-    main(["--serial", "/dev/ttyACM0"])
+    main(["--serial", "/dev/ttyACM0", "--poll-rate", "100"])
 
-    assert calls["argv"] == ("--serial", "/dev/ttyACM0")
+    assert calls["argv"] == ("/dev/ttyACM0", 100.0)
     assert calls["request_args"] == (DEFAULT_MASK, None)
     assert calls["open_target"] == target
     assert calls["open_timeout"] == DEFAULT_TIMEOUT
@@ -241,8 +279,18 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
         serial_port,
         b"imu-request",
         DEFAULT_TIMEOUT,
+        100.0,
         ANY,
     )
     assert serial_port.closed is True
-    assert "display=tui" in stderr_stream.getvalue()
+    assert "display=tui; poll_rate=<= 100 Hz" in stderr_stream.getvalue()
     assert HOST_RX_TIMING_NOTICE in stderr_stream.getvalue()
+
+
+def test_build_parser_accepts_poll_rate() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(["--serial", "/dev/ttyACM0", "--poll-rate", "100"])
+
+    assert args.serial == "/dev/ttyACM0"
+    assert args.poll_rate == pytest.approx(100.0)
