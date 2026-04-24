@@ -15,7 +15,6 @@ The current starting point is:
 - `src/vesc_py/live_signal.py`: generic single-signal source protocol, history,
   deterministic source, SMA/residual helpers.
 - `src/vesc_py/fast_imu_source.py`: one-axis direct VESC IMU source.
-- `examples/imu_signal_bench.py`: PyQtGraph one-axis SMA tuning UI.
 
 `examples/poll_imu_fast.py` should remain a separate high-rate reference/tool.
 
