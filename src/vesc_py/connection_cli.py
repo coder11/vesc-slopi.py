@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import curses
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, TextIO
 
@@ -134,6 +135,28 @@ def resolve_vesc_target_from_args(
         output_stream=output_stream,
     )
     return VescTarget(connection=connection, can_id=can_id)
+
+
+def run_vesc_connection_cli(
+    argv: Sequence[str] | None = None,
+    *,
+    include_can_id: bool = True,
+    fw_retries: int = 25,
+    input_stream: TextIO = sys.stdin,
+    output_stream: TextIO = sys.stderr,
+) -> VescTarget:
+    """Parse VESC connection CLI arguments and return the selected target."""
+    parser = argparse.ArgumentParser(
+        description="Select a direct VESC connection and optional CAN target.",
+    )
+    add_vesc_connection_arguments(parser, include_can_id=include_can_id)
+    args = parser.parse_args(argv)
+    return resolve_vesc_target_from_args(
+        args,
+        fw_retries=fw_retries,
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
 
 
 def _resolve_connection_from_args(
@@ -376,5 +399,6 @@ __all__ = [
     "add_vesc_connection_arguments",
     "discover_connection_candidates",
     "parse_can_id_arg",
+    "run_vesc_connection_cli",
     "resolve_vesc_target_from_args",
 ]

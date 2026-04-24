@@ -9,6 +9,7 @@ from vesc_py.connection import VescConnectionKind
 from vesc_py.connection_cli import (
     add_vesc_connection_arguments,
     parse_can_id_arg,
+    run_vesc_connection_cli,
     resolve_vesc_target_from_args,
 )
 from vesc_py.models import BleDevice, FwVersion, VescSerialPort
@@ -62,6 +63,18 @@ def test_resolve_target_uses_explicit_serial_and_can_id() -> None:
     args = parser.parse_args(["--serial", "/dev/ttyACM0", "--can-id", "9"])
 
     target = resolve_vesc_target_from_args(args, input_stream=io.StringIO(), output_stream=io.StringIO())
+
+    assert target.connection.kind is VescConnectionKind.SERIAL
+    assert target.connection.address == "/dev/ttyACM0"
+    assert target.can_id == 9
+
+
+def test_run_connection_cli_parses_args_and_returns_target() -> None:
+    target = run_vesc_connection_cli(
+        ["--serial", "/dev/ttyACM0", "--can-id", "9"],
+        input_stream=io.StringIO(),
+        output_stream=io.StringIO(),
+    )
 
     assert target.connection.kind is VescConnectionKind.SERIAL
     assert target.connection.address == "/dev/ttyACM0"

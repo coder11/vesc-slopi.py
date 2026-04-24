@@ -10,16 +10,14 @@ Examples:
 
 from __future__ import annotations
 
-import argparse
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from typing import Literal, cast
 
 import numpy as np
 
-from vesc_py.connection_cli import (
-    add_vesc_connection_arguments,
-    resolve_vesc_target_from_args,
-)
+from vesc_py.connection import VescTarget
+from vesc_py.connection_cli import run_vesc_connection_cli
 from vesc_py.fast_imu_source import (
     DEFAULT_PIPELINE_DEPTH,
     VescImuSignalSource,
@@ -62,19 +60,40 @@ DEFAULT_DETERMINISTIC_RATE = 500.0
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "dark"
+DEFAULT_SOURCE = "vesc"
+SOURCE_CHOICES = (
+    DEFAULT_SOURCE,
+    "deterministic",
+    "deterministic-noisy",
+    "deterministic-white-noise",
+)
+DEFAULT_TIMEOUT = 0.1
 
 SPECTRUM_OPTIONS = (
     ChoiceOption(value="psd", label="PSD"),
     ChoiceOption(value="fft", label="FFT"),
 )
 
+@dataclass(frozen=True, slots=True)
+class LiveSignalAnalysisConfig:
+    """Validated runtime options for the live signal analysis example."""
 
-def parse_axis_arg(text: str) -> str:
-    """Argparse wrapper for IMU axis parsing."""
-    try:
-        return parse_imu_axis(text)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
+    source: str = DEFAULT_SOURCE
+    axis: str = "acc_z"
+    pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
+    deterministic_rate: float = DEFAULT_DETERMINISTIC_RATE
+    timeout: float = DEFAULT_TIMEOUT
+
+    def __post_init__(self) -> None:
+        if self.source not in SOURCE_CHOICES:
+            raise ValueError(f"unsupported source {self.source!r}")
+        if self.pipeline_depth <= 0:
+            raise ValueError("pipeline_depth must be greater than 0")
+        if self.deterministic_rate <= 0.0:
+            raise ValueError("deterministic_rate must be greater than 0")
+        if self.timeout <= 0.0:
+            raise ValueError("timeout must be greater than 0")
+        object.__setattr__(self, "axis", parse_imu_axis(self.axis))
 
 
 def clamp_cutoff_hz(cutoff_hz: float, sample_rate_hz: float | None) -> float | None:
@@ -249,132 +268,91 @@ def build_analysis(
     )
 
 
-def build_parser() -> argparse.ArgumentParser:
-    """Build the command-line interface for the analysis example."""
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run a modular live signal analysis GUI with tunable controls and plots. "
-            "The VESC IMU axis analysis is the default proof-of-concept pipeline."
-        )
-    )
-    parser.add_argument(
-        "--source",
-        choices=("vesc", "deterministic", "deterministic-noisy", "deterministic-white-noise"),
-        default="vesc",
-        help="Signal source to use (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--axis",
-        type=parse_axis_arg,
-        default="acc_z",
-        help="IMU axis to analyze (default: %(default)s).",
-    )
-    add_vesc_connection_arguments(parser)
-    parser.add_argument(
-        "--pipeline-depth",
-        type=int,
-        default=DEFAULT_PIPELINE_DEPTH,
-        help="Outstanding COMM_GET_IMU_DATA requests for --source vesc (default: %(default)s).",
-    )
-    parser.add_argument(
-        "--deterministic-rate",
-        type=float,
-        default=DEFAULT_DETERMINISTIC_RATE,
-        help="Sample rate for synthetic sources in Hz (default: %(default)s).",
-    )
-    return parser
-
-
-def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
-    """Reject obviously invalid values before opening the GUI."""
-    if args.timeout <= 0.0:
-        parser.error("--timeout must be greater than 0")
-    if args.baudrate <= 0:
-        parser.error("--baudrate must be greater than 0")
-    if args.ble_scan_timeout <= 0.0:
-        parser.error("--ble-scan-timeout must be greater than 0")
-    if args.ble_connect_timeout <= 0.0:
-        parser.error("--ble-connect-timeout must be greater than 0")
-    if args.ble_chunk_size <= 0:
-        parser.error("--ble-chunk-size must be greater than 0")
-    if args.pipeline_depth <= 0:
-        parser.error("--pipeline-depth must be greater than 0")
-    if args.deterministic_rate <= 0.0:
-        parser.error("--deterministic-rate must be greater than 0")
-
-
-def make_source(args: argparse.Namespace) -> tuple[SignalBatchSource, str]:
+def make_source(
+    config: LiveSignalAnalysisConfig,
+    *,
+    vesc_target: VescTarget | None = None,
+) -> tuple[SignalBatchSource, str]:
     """Create the selected source and a UI label for it."""
-    axis = cast(str, args.axis)
+    axis = config.axis
     scalar_source: SignalSource
-    if args.source == "vesc":
-        target = resolve_vesc_target_from_args(args)
+    if config.source == DEFAULT_SOURCE:
+        if vesc_target is None:
+            raise ValueError("vesc_target is required when source='vesc'")
         scalar_source = VescImuSignalSource(
-            connection=target.connection,
+            connection=vesc_target.connection,
             axis=axis,
-            timeout=cast(float, args.timeout),
-            pipeline_depth=cast(int, args.pipeline_depth),
+            timeout=config.timeout,
+            pipeline_depth=config.pipeline_depth,
             pending_samples=DEFAULT_PENDING_SAMPLES,
-            can_id=target.can_id,
+            can_id=vesc_target.can_id,
         )
-        target_label = "direct controller" if target.can_id is None else f"CAN {target.can_id}"
+        target_label = (
+            "direct controller"
+            if vesc_target.can_id is None
+            else f"CAN {vesc_target.can_id}"
+        )
         return (
             ScalarSignalSourceAdapter(scalar_source),
             (
-                f"VESC IMU axis source: {axis} via {target.connection.describe()} "
+                f"VESC IMU axis source: {axis} via {vesc_target.connection.describe()} "
                 f"({target_label})"
             ),
         )
 
-    if args.source == "deterministic":
+    if config.source == "deterministic":
         scalar_source = DeterministicSignalSource(
             channel_name=axis,
             unit=imu_axis_unit(axis),
-            sample_rate_hz=cast(float, args.deterministic_rate),
+            sample_rate_hz=config.deterministic_rate,
             pending_samples=DEFAULT_PENDING_SAMPLES,
         )
         return (
             ScalarSignalSourceAdapter(scalar_source),
-            f"Deterministic source @ {cast(float, args.deterministic_rate):g} Hz",
+            f"Deterministic source @ {config.deterministic_rate:g} Hz",
         )
 
-    if args.source == "deterministic-noisy":
+    if config.source == "deterministic-noisy":
         scalar_source = NoisyDeterministicSignalSource(
             channel_name=axis,
             unit=imu_axis_unit(axis),
-            sample_rate_hz=cast(float, args.deterministic_rate),
+            sample_rate_hz=config.deterministic_rate,
             pending_samples=DEFAULT_PENDING_SAMPLES,
         )
         return (
             ScalarSignalSourceAdapter(scalar_source),
-            f"Deterministic noisy source @ {cast(float, args.deterministic_rate):g} Hz",
+            f"Deterministic noisy source @ {config.deterministic_rate:g} Hz",
         )
 
     scalar_source = DeterministicWhiteNoiseSignalSource(
         channel_name=axis,
         unit=imu_axis_unit(axis),
-        sample_rate_hz=cast(float, args.deterministic_rate),
+        sample_rate_hz=config.deterministic_rate,
         pending_samples=DEFAULT_PENDING_SAMPLES,
     )
     return (
         ScalarSignalSourceAdapter(scalar_source),
-        f"Deterministic white-noise source @ {cast(float, args.deterministic_rate):g} Hz",
+        f"Deterministic white-noise source @ {config.deterministic_rate:g} Hz",
     )
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     """Parse CLI args and run the proof-of-concept analysis app."""
-    parser = build_parser()
-    args = parser.parse_args()
-    validate_args(parser, args)
+    from examples.yalsa.live_signal_analysis_cli import parse_live_signal_analysis_cli
 
-    source, source_label = make_source(args)
-    axis = cast(str, args.axis)
-    unit = imu_axis_unit(axis)
+    parsed = parse_live_signal_analysis_cli(argv)
+    vesc_target = None
+    if parsed.config.source == DEFAULT_SOURCE:
+        vesc_target = run_vesc_connection_cli(
+            (*parsed.vesc_argv, "--timeout", str(parsed.config.timeout))
+        )
+
+    source, source_label = make_source(parsed.config, vesc_target=vesc_target)
+    unit = imu_axis_unit(parsed.config.axis)
     app = build_analysis(
         source=source,
         source_label=source_label,
-        axis=axis,
+        axis=parsed.config.axis,
         unit=unit,
     )
     run_live_analysis(app)
