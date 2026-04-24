@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """YALSA app with a VESC IMU axis proof of concept.
 
+Edit the ``RUN_*`` module variables below to choose the signal source and
+runtime parameters.
+
 Examples:
-    uv run examples/yalsa/live_signal_analysis.py --source deterministic --axis acc_z
-    uv run examples/yalsa/live_signal_analysis.py --source deterministic-white-noise --axis gyro_z
-    uv run examples/yalsa/live_signal_analysis.py --source vesc --axis acc_z --serial /dev/ttyACM0
-    uv run examples/yalsa/live_signal_analysis.py --source vesc --axis acc_z --ble AA:BB:CC:DD:EE:FF
+    uv run examples/yalsa/live_signal_analysis.py
+    uv run examples/yalsa/live_signal_analysis.py --serial /dev/ttyACM0
+    uv run examples/yalsa/live_signal_analysis.py --ble AA:BB:CC:DD:EE:FF
 """
 
 from __future__ import annotations
@@ -69,6 +71,13 @@ SOURCE_CHOICES = (
 )
 DEFAULT_TIMEOUT = 0.1
 
+# Edit these values directly instead of passing example-specific CLI flags.
+RUN_SOURCE = DEFAULT_SOURCE
+RUN_AXIS = "acc_z"
+RUN_PIPELINE_DEPTH = DEFAULT_PIPELINE_DEPTH
+RUN_DETERMINISTIC_RATE = DEFAULT_DETERMINISTIC_RATE
+RUN_TIMEOUT = DEFAULT_TIMEOUT
+
 SPECTRUM_OPTIONS = (
     ChoiceOption(value="psd", label="PSD"),
     ChoiceOption(value="fft", label="FFT"),
@@ -94,6 +103,17 @@ class LiveSignalAnalysisConfig:
         if self.timeout <= 0.0:
             raise ValueError("timeout must be greater than 0")
         object.__setattr__(self, "axis", parse_imu_axis(self.axis))
+
+
+def build_runtime_config() -> LiveSignalAnalysisConfig:
+    """Build the example configuration from module-level settings."""
+    return LiveSignalAnalysisConfig(
+        source=RUN_SOURCE,
+        axis=RUN_AXIS,
+        pipeline_depth=RUN_PIPELINE_DEPTH,
+        deterministic_rate=RUN_DETERMINISTIC_RATE,
+        timeout=RUN_TIMEOUT,
+    )
 
 
 def clamp_cutoff_hz(cutoff_hz: float, sample_rate_hz: float | None) -> float | None:
@@ -337,22 +357,21 @@ def make_source(
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """Parse CLI args and run the proof-of-concept analysis app."""
-    from examples.yalsa.live_signal_analysis_cli import parse_live_signal_analysis_cli
-
-    parsed = parse_live_signal_analysis_cli(argv)
+    """Run the proof-of-concept analysis app using module-level settings."""
+    config = build_runtime_config()
     vesc_target = None
-    if parsed.config.source == DEFAULT_SOURCE:
+    if config.source == DEFAULT_SOURCE:
+        vesc_argv = () if argv is None else tuple(argv)
         vesc_target = run_vesc_connection_cli(
-            (*parsed.vesc_argv, "--timeout", str(parsed.config.timeout))
+            (*vesc_argv, "--timeout", str(config.timeout))
         )
 
-    source, source_label = make_source(parsed.config, vesc_target=vesc_target)
-    unit = imu_axis_unit(parsed.config.axis)
+    source, source_label = make_source(config, vesc_target=vesc_target)
+    unit = imu_axis_unit(config.axis)
     app = build_analysis(
         source=source,
         source_label=source_label,
-        axis=parsed.config.axis,
+        axis=config.axis,
         unit=unit,
     )
     run_live_analysis(app)

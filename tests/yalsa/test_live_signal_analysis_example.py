@@ -6,10 +6,10 @@ from examples.yalsa.live_signal_analysis import (
     LiveSignalAnalysisConfig,
     build_analysis,
     build_axis_analysis_processor,
+    build_runtime_config,
     clamp_cutoff_hz,
     make_source,
 )
-from examples.yalsa.live_signal_analysis_cli import parse_live_signal_analysis_cli
 from vesc_py.connection import VescConnection, VescTarget
 from yalsa import AnalysisInput, SignalBatch, SignalBatchSourceSnapshot
 
@@ -132,38 +132,70 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
     assert len(app.plots) == 2
 
 
-def test_parse_live_signal_analysis_cli_preserves_vesc_args() -> None:
-    parsed = parse_live_signal_analysis_cli(
-        [
-            "--source",
-            "vesc",
-            "--axis",
-            "gyro_z",
-            "--timeout",
-            "0.25",
-            "--pipeline-depth",
-            "7",
-            "--serial",
-            "/dev/ttyACM0",
-            "--can-id",
-            "4",
-        ]
-    )
+def test_build_runtime_config_reads_module_level_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "deterministic-noisy")
+    monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "gyro_z")
+    monkeypatch.setattr(live_signal_analysis, "RUN_PIPELINE_DEPTH", 7)
+    monkeypatch.setattr(live_signal_analysis, "RUN_DETERMINISTIC_RATE", 321.0)
+    monkeypatch.setattr(live_signal_analysis, "RUN_TIMEOUT", 0.25)
 
-    assert parsed.config == LiveSignalAnalysisConfig(
-        source="vesc",
+    assert build_runtime_config() == LiveSignalAnalysisConfig(
+        source="deterministic-noisy",
         axis="gyro_z",
         timeout=0.25,
+        deterministic_rate=321.0,
         pipeline_depth=7,
     )
-    assert parsed.vesc_argv == ("--serial", "/dev/ttyACM0", "--can-id", "4")
 
 
-def test_parse_live_signal_analysis_cli_rejects_vesc_args_for_other_sources() -> None:
-    with pytest.raises(SystemExit):
-        parse_live_signal_analysis_cli(
-            ["--source", "deterministic", "--serial", "/dev/ttyACM0"]
-        )
+def test_main_skips_vesc_connection_cli_for_non_vesc_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    fake_app = object()
+
+    def fake_run_vesc_connection_cli(argv: tuple[str, ...]) -> VescTarget:
+        raise AssertionError(f"unexpected VESC CLI call with {argv!r}")
+
+    def fake_make_source(
+        config: LiveSignalAnalysisConfig,
+        *,
+        vesc_target: VescTarget | None = None,
+    ) -> tuple[object, str]:
+        calls["config"] = config
+        calls["vesc_target"] = vesc_target
+        return object(), "source label"
+
+    def fake_build_analysis(**kwargs: object) -> object:
+        calls["build_analysis_kwargs"] = kwargs
+        return fake_app
+
+    def fake_run_live_analysis(app: object) -> None:
+        calls["app"] = app
+
+    monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "deterministic")
+    monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "gyro_z")
+    monkeypatch.setattr(live_signal_analysis, "RUN_DETERMINISTIC_RATE", 321.0)
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "run_vesc_connection_cli",
+        fake_run_vesc_connection_cli,
+    )
+    monkeypatch.setattr(live_signal_analysis, "make_source", fake_make_source)
+    monkeypatch.setattr(live_signal_analysis, "build_analysis", fake_build_analysis)
+    monkeypatch.setattr(live_signal_analysis, "run_live_analysis", fake_run_live_analysis)
+
+    live_signal_analysis.main(["--serial", "/dev/ttyACM0"])
+
+    assert calls["config"] == LiveSignalAnalysisConfig(
+        source="deterministic",
+        axis="gyro_z",
+        deterministic_rate=321.0,
+    )
+    assert calls["vesc_target"] is None
+    assert calls["app"] is fake_app
 
 
 def test_main_runs_vesc_connection_cli_for_vesc_source(
@@ -201,15 +233,12 @@ def test_main_runs_vesc_connection_cli_for_vesc_source(
     monkeypatch.setattr(live_signal_analysis, "make_source", fake_make_source)
     monkeypatch.setattr(live_signal_analysis, "build_analysis", fake_build_analysis)
     monkeypatch.setattr(live_signal_analysis, "run_live_analysis", fake_run_live_analysis)
+    monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "vesc")
+    monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "acc_z")
+    monkeypatch.setattr(live_signal_analysis, "RUN_TIMEOUT", 0.25)
 
     live_signal_analysis.main(
         [
-            "--source",
-            "vesc",
-            "--axis",
-            "acc_z",
-            "--timeout",
-            "0.25",
             "--serial",
             "/dev/ttyACM0",
         ]
