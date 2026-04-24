@@ -94,7 +94,7 @@ not raw polling throughput.
 ## Acceptance Criteria
 
 - GUI mode raw poll average is close to text-mode raw poll average using the same
-  `--fields`/`--mask` and `--pipeline-depth`.
+  `--fields`/`--mask`.
 - Closing the GUI reliably stops the acquisition process and closes the serial
   port.
 - A slow or busy GUI does not block acquisition.

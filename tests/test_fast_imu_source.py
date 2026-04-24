@@ -60,7 +60,6 @@ def test_vesc_source_constructor_rejects_invalid_values() -> None:
         "connection": VescConnection.serial("/dev/null"),
         "axis": "acc_x",
         "timeout": 0.1,
-        "pipeline_depth": 1,
         "pending_samples": 64,
     }
 
@@ -68,8 +67,6 @@ def test_vesc_source_constructor_rejects_invalid_values() -> None:
         VescImuSignalSource(**{**base, "axis": "bad"})
     with pytest.raises(ValueError, match="timeout"):
         VescImuSignalSource(**{**base, "timeout": 0.0})
-    with pytest.raises(ValueError, match="pipeline_depth"):
-        VescImuSignalSource(**{**base, "pipeline_depth": 0})
     with pytest.raises(ValueError, match="can_id"):
         VescImuSignalSource(**{**base, "can_id": 254})
     with pytest.raises(ValueError, match="capacity"):
@@ -81,7 +78,6 @@ def test_vesc_source_constructor_exposes_channel_and_unit_without_opening_serial
         connection=VescConnection.serial("/dev/null"),
         axis="gyro-z",
         timeout=0.1,
-        pipeline_depth=1,
         pending_samples=64,
     )
 

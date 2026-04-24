@@ -12,7 +12,12 @@ import numpy.typing as npt
 
 from vesc_py.buffer import VescBuffer
 from vesc_py.comm_ids import CommPacketId
-from vesc_py.connection import BlockingIo, VescConnection, build_imu_request, open_blocking_io
+from vesc_py.connection import (
+    BlockingIo,
+    VescConnection,
+    build_imu_request,
+    open_blocking_io,
+)
 from vesc_py.crc import crc16
 from vesc_py.imu import IMU_FIELDS
 from vesc_py.live_signal import (
@@ -24,7 +29,6 @@ from vesc_py.packet import MAX_PACKET_LEN
 
 DEFAULT_BAUDRATE = 115200
 DEFAULT_TIMEOUT = 0.1
-DEFAULT_PIPELINE_DEPTH = 1
 
 IMU_BENCH_FIELDS = (
     "roll",
@@ -226,21 +230,17 @@ class VescImuSignalSource:
         connection: VescConnection,
         axis: str,
         timeout: float,
-        pipeline_depth: int,
         pending_samples: int,
         can_id: int | None = None,
     ) -> None:
         if timeout <= 0.0:
             raise ValueError("timeout must be greater than 0")
-        if pipeline_depth <= 0:
-            raise ValueError("pipeline_depth must be greater than 0")
         if can_id is not None and not 0 <= can_id <= 253:
             raise ValueError("can_id must be in range 0..253")
 
         self._connection = connection
         self._axis = parse_imu_axis(axis)
         self._timeout = timeout
-        self._pipeline_depth = pipeline_depth
         self._can_id = can_id
         self._mask = imu_axis_mask(self._axis)
         self._request = build_imu_request(self._mask, can_id=can_id)
@@ -337,7 +337,6 @@ class VescImuSignalSource:
 
     def _run(self) -> None:
         self._start_ns = time.perf_counter_ns()
-        outstanding = 0
         pending_timestamps: list[float] = []
         pending_values: list[float] = []
         next_flush_ns = self._start_ns + 5_000_000
@@ -351,9 +350,7 @@ class VescImuSignalSource:
                 if serial_port is None:
                     break
 
-                while outstanding < self._pipeline_depth and not self._stop.is_set():
-                    serial_port.write(self._request)
-                    outstanding += 1
+                serial_port.write(self._request)
 
                 payload = _read_expected_imu_packet(
                     serial_port,
@@ -363,11 +360,9 @@ class VescImuSignalSource:
                 now_ns = time.perf_counter_ns()
                 if payload is None:
                     self._stats.timeouts += 1
-                    outstanding = 0
                     serial_port.reset_input_buffer()
                     continue
 
-                outstanding = max(0, outstanding - 1)
                 try:
                     value = self._value_from_payload(payload)
                 except ValueError as exc:
@@ -405,7 +400,6 @@ class VescImuSignalSource:
 
 __all__ = [
     "DEFAULT_BAUDRATE",
-    "DEFAULT_PIPELINE_DEPTH",
     "DEFAULT_TIMEOUT",
     "IMU_BENCH_FIELDS",
     "VescImuSignalSource",

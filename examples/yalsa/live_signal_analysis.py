@@ -21,7 +21,6 @@ import numpy as np
 from vesc_py.connection import VescTarget
 from vesc_py.connection_cli import run_vesc_connection_cli
 from vesc_py.fast_imu_source import (
-    DEFAULT_PIPELINE_DEPTH,
     VescImuSignalSource,
     imu_axis_unit,
     parse_imu_axis,
@@ -74,7 +73,6 @@ DEFAULT_TIMEOUT = 0.1
 # Edit these values directly instead of passing example-specific CLI flags.
 RUN_SOURCE = DEFAULT_SOURCE
 RUN_AXIS = "acc_z"
-RUN_PIPELINE_DEPTH = DEFAULT_PIPELINE_DEPTH
 RUN_DETERMINISTIC_RATE = DEFAULT_DETERMINISTIC_RATE
 RUN_TIMEOUT = DEFAULT_TIMEOUT
 
@@ -89,15 +87,12 @@ class LiveSignalAnalysisConfig:
 
     source: str = DEFAULT_SOURCE
     axis: str = "acc_z"
-    pipeline_depth: int = DEFAULT_PIPELINE_DEPTH
     deterministic_rate: float = DEFAULT_DETERMINISTIC_RATE
     timeout: float = DEFAULT_TIMEOUT
 
     def __post_init__(self) -> None:
         if self.source not in SOURCE_CHOICES:
             raise ValueError(f"unsupported source {self.source!r}")
-        if self.pipeline_depth <= 0:
-            raise ValueError("pipeline_depth must be greater than 0")
         if self.deterministic_rate <= 0.0:
             raise ValueError("deterministic_rate must be greater than 0")
         if self.timeout <= 0.0:
@@ -110,7 +105,6 @@ def build_runtime_config() -> LiveSignalAnalysisConfig:
     return LiveSignalAnalysisConfig(
         source=RUN_SOURCE,
         axis=RUN_AXIS,
-        pipeline_depth=RUN_PIPELINE_DEPTH,
         deterministic_rate=RUN_DETERMINISTIC_RATE,
         timeout=RUN_TIMEOUT,
     )
@@ -303,7 +297,6 @@ def make_source(
             connection=vesc_target.connection,
             axis=axis,
             timeout=config.timeout,
-            pipeline_depth=config.pipeline_depth,
             pending_samples=DEFAULT_PENDING_SAMPLES,
             can_id=vesc_target.can_id,
         )

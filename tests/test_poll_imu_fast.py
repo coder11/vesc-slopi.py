@@ -7,7 +7,6 @@ import pytest
 
 from examples.poll_imu_fast import (
     DEFAULT_MASK,
-    DEFAULT_PIPELINE_DEPTH,
     DEFAULT_TIMEOUT,
     HOST_RX_TIMING_NOTICE,
     ParsedImu,
@@ -173,7 +172,6 @@ def test_poll_imu_renders_via_tui() -> None:
         serial_port,
         request=b"imu-request",
         packet_timeout=1.0,
-        pipeline_depth=1,
         status_stream=status_stream,
         tui=tui,
         max_samples=1,
@@ -217,7 +215,6 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
         *,
         request: bytes,
         packet_timeout: float,
-        pipeline_depth: int,
         tui: object | None = None,
         **_: object,
     ) -> None:
@@ -225,7 +222,6 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
             resolved_serial_port,
             request,
             packet_timeout,
-            pipeline_depth,
             tui,
         )
 
@@ -245,7 +241,6 @@ def test_main_uses_shared_connection_cli_and_fixed_defaults(
         serial_port,
         b"imu-request",
         DEFAULT_TIMEOUT,
-        DEFAULT_PIPELINE_DEPTH,
         ANY,
     )
     assert serial_port.closed is True

@@ -10,7 +10,6 @@ interface from ``vesc_py.connection_cli``. All polling settings are fixed
 in this file:
 
 - mask: roll/pitch/yaw + accelerometer + gyroscope
-- pipeline depth: 1
 - packet timeout: 0.1 s
 
 Examples:
@@ -42,7 +41,6 @@ from vesc_py.imu import IMU_FIELDS
 from vesc_py.packet import MAX_PACKET_LEN
 
 DEFAULT_MASK = 0x01FF
-DEFAULT_PIPELINE_DEPTH = 1
 DEFAULT_TIMEOUT = 0.1
 DEFAULT_STATUS_INTERVAL = 1.0
 DEFAULT_UI_RATE = 10.0
@@ -171,8 +169,7 @@ class TerminalImuDisplay:
             "IMU values",
         ]
         lines.extend(
-            f"{name:<8} {value:>16.8g}"
-            for name, value in zip(names, parsed.values)
+            f"{name:<8} {value:>16.8g}" for name, value in zip(names, parsed.values)
         )
 
         if self._line_count > 0:
@@ -364,7 +361,6 @@ def poll_imu(
     *,
     request: bytes,
     packet_timeout: float,
-    pipeline_depth: int,
     status_stream: TextIO = sys.stderr,
     status_interval: float = DEFAULT_STATUS_INTERVAL,
     tui: TerminalImuDisplay | None = None,
@@ -378,7 +374,6 @@ def poll_imu(
     next_status_ns = start_ns + round(status_interval * NSEC_PER_SEC)
     status_window_ns = start_ns
     status_window_samples = 0
-    outstanding = 0
     latest: ParsedImu | None = None
 
     if tui is not None:
@@ -386,10 +381,8 @@ def poll_imu(
 
     try:
         while max_samples <= 0 or poll_stats.samples < max_samples:
-            while outstanding < pipeline_depth:
-                serial_port.write(request)
-                poll_stats.requests += 1
-                outstanding += 1
+            serial_port.write(request)
+            poll_stats.requests += 1
 
             payload = read_expected_imu_packet(
                 serial_port,
@@ -399,11 +392,9 @@ def poll_imu(
             now_ns = time.perf_counter_ns()
             if payload is None:
                 poll_stats.timeouts += 1
-                outstanding = 0
                 serial_port.reset_input_buffer()
                 continue
 
-            outstanding = max(0, outstanding - 1)
             status_window_samples += 1
             try:
                 latest = parse_imu_payload(payload)
@@ -484,7 +475,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     target_label = "" if target.can_id is None else f"; target_can_id={target.can_id}"
     use_tui = sys.stderr.isatty()
     display = "tui" if use_tui else "plain"
-    tui = TerminalImuDisplay(refresh_hz=DEFAULT_UI_RATE, stream=sys.stderr) if use_tui else None
+    tui = (
+        TerminalImuDisplay(refresh_hz=DEFAULT_UI_RATE, stream=sys.stderr)
+        if use_tui
+        else None
+    )
 
     serial_port, connection_label = open_poll_connection(
         target, timeout=DEFAULT_TIMEOUT
@@ -497,7 +492,7 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     print(
         f"Opening {link_label}; mask=0x{DEFAULT_MASK:04x} ({fields}); "
-        f"pipeline_depth={DEFAULT_PIPELINE_DEPTH}; display={display}{target_label}",
+        f"display={display}{target_label}",
         file=sys.stderr,
     )
     print(HOST_RX_TIMING_NOTICE, file=sys.stderr)
@@ -507,7 +502,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             serial_port,
             request=request,
             packet_timeout=DEFAULT_TIMEOUT,
-            pipeline_depth=DEFAULT_PIPELINE_DEPTH,
             tui=tui,
         )
     finally:

@@ -4,7 +4,6 @@
 Examples:
     uv run examples/imu_signal_bench.py --source deterministic --axis acc_z --filter sma
     uv run examples/imu_signal_bench.py --source deterministic-white-noise --axis acc_z
-    uv run examples/imu_signal_bench.py --source vesc --axis acc_z --pipeline-depth 4
 """
 
 from __future__ import annotations
@@ -27,7 +26,6 @@ from vesc_py import list_serial_ports
 from vesc_py.connection import VescConnection
 from vesc_py.fast_imu_source import (
     DEFAULT_BAUDRATE,
-    DEFAULT_PIPELINE_DEPTH,
     DEFAULT_TIMEOUT,
     IMU_BENCH_FIELDS,
     VescImuSignalSource,
@@ -1183,16 +1181,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Per-response timeout for --source vesc (default: {DEFAULT_TIMEOUT:g}).",
     )
     parser.add_argument(
-        "--pipeline-depth",
-        type=int,
-        default=DEFAULT_PIPELINE_DEPTH,
-        metavar="N",
-        help=(
-            "Outstanding IMU requests for --source vesc "
-            f"(default: {DEFAULT_PIPELINE_DEPTH})."
-        ),
-    )
-    parser.add_argument(
         "--axis",
         type=parse_axis_arg,
         default="acc_x",
@@ -1312,8 +1300,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("--baudrate must be greater than 0")
     if args.timeout <= 0.0:
         parser.error("--timeout must be greater than 0")
-    if args.pipeline_depth <= 0:
-        parser.error("--pipeline-depth must be greater than 0")
     if args.filter_cutoff_hz <= 0.0:
         parser.error("--filter-cutoff-hz must be greater than 0")
     if args.biquad_shape <= 0.0:
@@ -1378,7 +1364,6 @@ def make_source(args: argparse.Namespace) -> tuple[SignalSource, str]:
             ),
             axis=axis,
             timeout=cast(float, args.timeout),
-            pipeline_depth=cast(int, args.pipeline_depth),
             pending_samples=cast(int, args.pending_samples),
         ),
         f"VESC serial source: {port}",

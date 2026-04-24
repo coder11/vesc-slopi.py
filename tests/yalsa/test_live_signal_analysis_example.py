@@ -137,7 +137,6 @@ def test_build_runtime_config_reads_module_level_settings(
 ) -> None:
     monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "deterministic-noisy")
     monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "gyro_z")
-    monkeypatch.setattr(live_signal_analysis, "RUN_PIPELINE_DEPTH", 7)
     monkeypatch.setattr(live_signal_analysis, "RUN_DETERMINISTIC_RATE", 321.0)
     monkeypatch.setattr(live_signal_analysis, "RUN_TIMEOUT", 0.25)
 
@@ -146,7 +145,6 @@ def test_build_runtime_config_reads_module_level_settings(
         axis="gyro_z",
         timeout=0.25,
         deterministic_rate=321.0,
-        pipeline_depth=7,
     )
 
 
