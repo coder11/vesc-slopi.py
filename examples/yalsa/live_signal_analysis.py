@@ -25,42 +25,43 @@ from vesc_py.fast_imu_source import (
     imu_axis_unit,
     parse_imu_axis,
 )
-from yalsa import (
-    AnalysisInput,
-    AnalysisResult,
-    ChoiceOption,
-    LiveAnalysisApp,
-    ParamValue,
-    ProcessCallback,
-    PlotSpec,
-    PlotTrace,
-    ScalarSignalSourceAdapter,
-    SignalBatchSource,
-    choice_parameter,
-    float_parameter,
-    int_parameter,
-    butter_lowpass_hz,
-    fft_magnitude,
-    run_live_analysis,
-    signal_stats,
-    welch_psd,
-    xy_series,
-)
 from vesc_py.live_signal import (
     DeterministicSignalSource,
     DeterministicWhiteNoiseSignalSource,
     NoisyDeterministicSignalSource,
     SignalSource,
 )
+from yalsa import (
+    AnalysisInput,
+    AnalysisResult,
+    ChoiceOption,
+    LiveAnalysisApp,
+    ParamValue,
+    PlotSpec,
+    PlotTrace,
+    ProcessCallback,
+    ScalarSignalSourceAdapter,
+    SignalBatchSource,
+    butter_lowpass_hz,
+    choice_parameter,
+    fft_magnitude,
+    float_parameter,
+    int_parameter,
+    run_live_analysis,
+    signal_stats,
+    welch_psd,
+    xy_series,
+)
 
-DEFAULT_HISTORY = 20_000
+DEFAULT_HISTORY = 4_096
 DEFAULT_MAX_POINTS = 1_200
-DEFAULT_PLOT_RATE = 30.0
+DEFAULT_PLOT_RATE = 15.0
 DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
-DEFAULT_THEME: Literal["light", "dark"] = "dark"
+DEFAULT_ANALYSIS_WINDOW = DEFAULT_HISTORY
+DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
 SOURCE_CHOICES = (
     DEFAULT_SOURCE,
@@ -80,6 +81,7 @@ SPECTRUM_OPTIONS = (
     ChoiceOption(value="psd", label="PSD"),
     ChoiceOption(value="fft", label="FFT"),
 )
+
 
 @dataclass(frozen=True, slots=True)
 class LiveSignalAnalysisConfig:
@@ -145,6 +147,10 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
                 status_text="waiting for samples",
             )
 
+        if int(raw.size) > DEFAULT_ANALYSIS_WINDOW:
+            timestamps = timestamps[-DEFAULT_ANALYSIS_WINDOW:]
+            raw = raw[-DEFAULT_ANALYSIS_WINDOW:]
+
         sample_rate_hz = data.sample_rate_hz
         requested_cutoff_hz = float(cast(float, params["cutoff_hz"]))
         cutoff_hz = clamp_cutoff_hz(requested_cutoff_hz, sample_rate_hz)
@@ -193,7 +199,9 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
             f"order: {filter_order}",
         ]
         if cutoff_hz is not None and cutoff_hz != requested_cutoff_hz:
-            status_parts.append(f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz")
+            status_parts.append(
+                f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz"
+            )
         if raw_stats is not None:
             status_parts.append(f"raw RMS: {raw_stats.rms:.6g} {unit}")
         if filtered_stats is not None:

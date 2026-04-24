@@ -588,6 +588,12 @@ PLOT_THEMES = {
 }
 
 
+@dataclass(slots=True)
+class _PlotRangeTracker:
+    x_bounds: tuple[float, float] | None = None
+    y_bounds: tuple[float, float] | None = None
+
+
 def prefer_qt_xcb_platform() -> None:
     """Prefer Qt's XCB backend when Linux exposes a Wayland/X11 fallback chain."""
     if (
@@ -658,6 +664,63 @@ def _format_latest_values(
         unit = channels.get(channel_name, "")
         parts.append(f"{channel_name}={value:.6g}{(' ' + unit) if unit else ''}")
     return ", ".join(parts)
+
+
+def _finite_bounds(values: FloatArray) -> tuple[float, float] | None:
+    if int(values.size) == 0:
+        return None
+    finite = values[np.isfinite(values)]
+    if int(finite.size) == 0:
+        return None
+    lower = float(np.min(finite))
+    upper = float(np.max(finite))
+    if lower == upper:
+        pad = 1.0 if lower == 0.0 else abs(lower) * 0.05
+        return lower - pad, upper + pad
+    return lower, upper
+
+
+def _merge_bounds(
+    current: tuple[float, float] | None,
+    incoming: tuple[float, float] | None,
+) -> tuple[float, float] | None:
+    if incoming is None:
+        return current
+    if current is None:
+        return incoming
+    return min(current[0], incoming[0]), max(current[1], incoming[1])
+
+
+def _bounds_changed(
+    previous: tuple[float, float] | None,
+    current: tuple[float, float] | None,
+    *,
+    rel_tol: float = 0.02,
+    abs_tol: float = 1e-9,
+) -> bool:
+    if previous is None or current is None:
+        return previous != current
+    for previous_value, current_value in zip(previous, current, strict=True):
+        delta = abs(previous_value - current_value)
+        scale = max(abs(previous_value), abs(current_value))
+        if delta > max(abs_tol, scale * rel_tol):
+            return True
+    return False
+
+
+def _update_plot_ranges(
+    plot_item: Any,
+    tracker: _PlotRangeTracker,
+    *,
+    x_bounds: tuple[float, float] | None,
+    y_bounds: tuple[float, float] | None,
+) -> None:
+    if x_bounds is not None and _bounds_changed(tracker.x_bounds, x_bounds):
+        plot_item.setXRange(*x_bounds, padding=0.0)
+        tracker.x_bounds = x_bounds
+    if y_bounds is not None and _bounds_changed(tracker.y_bounds, y_bounds):
+        plot_item.setYRange(*y_bounds, padding=0.0)
+        tracker.y_bounds = y_bounds
 
 
 def run_live_analysis(config: LiveAnalysisApp) -> None:
@@ -731,6 +794,7 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
 
     plot_items: list[Any] = []
     plot_curves: list[dict[str, Any]] = []
+    plot_range_trackers: list[_PlotRangeTracker] = []
     color_cycle = cycle(selected_theme.line_colors)
     for plot_index, plot_spec in enumerate(config.plots):
         widget = pg.PlotWidget(title=plot_spec.title)
@@ -744,6 +808,9 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
         plot_item.setLogMode(x=plot_spec.log_x, y=plot_spec.log_y)
         plot_item.addLegend(offset=(10, 10))
         plot_item.setMouseEnabled(x=True, y=True)
+        disable_auto_range = getattr(plot_item, "disableAutoRange", None)
+        if callable(disable_auto_range):
+            disable_auto_range()
 
         curves: dict[str, Any] = {}
         for trace in plot_spec.traces:
@@ -764,6 +831,7 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
 
         plot_items.append(plot_item)
         plot_curves.append(curves)
+        plot_range_trackers.append(_PlotRangeTracker())
 
     history = SignalBatchHistory(config.history, config.source.channels)
     last_result: AnalysisResult | None = None
@@ -787,12 +855,15 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
             last_result = result
             last_process_error = None
 
-        for plot_spec, plot_item, curves in zip(
+        for plot_spec, plot_item, curves, range_tracker in zip(
             config.plots,
             plot_items,
             plot_curves,
+            plot_range_trackers,
             strict=True,
         ):
+            x_bounds: tuple[float, float] | None = None
+            y_bounds: tuple[float, float] | None = None
             for trace in plot_spec.traces:
                 series = None if last_result is None else last_result.series.get(trace.series)
                 curve = curves[trace.series]

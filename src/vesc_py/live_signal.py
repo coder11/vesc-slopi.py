@@ -29,6 +29,27 @@ class SignalSourceSnapshot:
     latest_value: float | None
     last_error: str | None
     done: bool
+    debug_text: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PendingBufferStatsSnapshot:
+    """Cumulative lock and traffic statistics for ``PendingSignalBuffer``."""
+
+    append_calls: int
+    append_samples: int
+    append_lock_wait_ns_total: int
+    append_lock_wait_ns_max: int
+    append_lock_hold_ns_total: int
+    append_lock_hold_ns_max: int
+    drain_calls: int
+    drain_samples: int
+    drain_lock_wait_ns_total: int
+    drain_lock_wait_ns_max: int
+    drain_lock_hold_ns_total: int
+    drain_lock_hold_ns_max: int
+    dropped_samples: int
+    high_watermark: int
 
 
 class SignalSource(Protocol):
@@ -63,6 +84,20 @@ class PendingSignalBuffer:
         self._write_index = 0
         self._count = 0
         self._dropped = 0
+        self._append_calls = 0
+        self._append_samples = 0
+        self._append_lock_wait_ns_total = 0
+        self._append_lock_wait_ns_max = 0
+        self._append_lock_hold_ns_total = 0
+        self._append_lock_hold_ns_max = 0
+        self._drain_calls = 0
+        self._drain_samples = 0
+        self._drain_lock_wait_ns_total = 0
+        self._drain_lock_wait_ns_max = 0
+        self._drain_lock_hold_ns_total = 0
+        self._drain_lock_hold_ns_max = 0
+        self._total_dropped = 0
+        self._high_watermark = 0
 
     def append(self, timestamp_s: float, value: float) -> None:
         """Append one sample, overwriting the oldest pending sample if full."""
@@ -83,72 +118,121 @@ class PendingSignalBuffer:
         timestamp_values = np.asarray(timestamps, dtype=np.float64)
         sample_values = np.asarray(values, dtype=np.float64)
 
+        lock_wait_start_ns = time.perf_counter_ns()
         with self._lock:
-            if count >= self._capacity:
-                self._dropped += self._count + count - self._capacity
-                self._timestamps[:] = timestamp_values[-self._capacity :]
-                self._values[:] = sample_values[-self._capacity :]
-                self._read_index = 0
-                self._write_index = 0
-                self._count = self._capacity
-                return
+            lock_acquired_ns = time.perf_counter_ns()
+            wait_ns = lock_acquired_ns - lock_wait_start_ns
+            self._append_calls += 1
+            self._append_samples += count
+            self._append_lock_wait_ns_total += wait_ns
+            self._append_lock_wait_ns_max = max(self._append_lock_wait_ns_max, wait_ns)
+            try:
+                if count >= self._capacity:
+                    dropped = self._count + count - self._capacity
+                    self._dropped += dropped
+                    self._total_dropped += dropped
+                    self._timestamps[:] = timestamp_values[-self._capacity :]
+                    self._values[:] = sample_values[-self._capacity :]
+                    self._read_index = 0
+                    self._write_index = 0
+                    self._count = self._capacity
+                    self._high_watermark = max(self._high_watermark, self._count)
+                    return
 
-            overflow = max(0, self._count + count - self._capacity)
-            if overflow > 0:
-                self._read_index = (self._read_index + overflow) % self._capacity
-                self._dropped += overflow
-            self._count = min(self._capacity, self._count + count)
+                overflow = max(0, self._count + count - self._capacity)
+                if overflow > 0:
+                    self._read_index = (self._read_index + overflow) % self._capacity
+                    self._dropped += overflow
+                    self._total_dropped += overflow
+                self._count = min(self._capacity, self._count + count)
 
-            first_count = min(count, self._capacity - self._write_index)
-            self._timestamps[self._write_index : self._write_index + first_count] = (
-                timestamp_values[:first_count]
-            )
-            self._values[self._write_index : self._write_index + first_count] = (
-                sample_values[:first_count]
-            )
+                first_count = min(count, self._capacity - self._write_index)
+                self._timestamps[self._write_index : self._write_index + first_count] = (
+                    timestamp_values[:first_count]
+                )
+                self._values[self._write_index : self._write_index + first_count] = (
+                    sample_values[:first_count]
+                )
 
-            remaining = count - first_count
-            if remaining > 0:
-                self._timestamps[:remaining] = timestamp_values[first_count:]
-                self._values[:remaining] = sample_values[first_count:]
+                remaining = count - first_count
+                if remaining > 0:
+                    self._timestamps[:remaining] = timestamp_values[first_count:]
+                    self._values[:remaining] = sample_values[first_count:]
 
-            self._write_index = (self._write_index + count) % self._capacity
+                self._write_index = (self._write_index + count) % self._capacity
+                self._high_watermark = max(self._high_watermark, self._count)
+            finally:
+                hold_ns = time.perf_counter_ns() - lock_acquired_ns
+                self._append_lock_hold_ns_total += hold_ns
+                self._append_lock_hold_ns_max = max(self._append_lock_hold_ns_max, hold_ns)
 
     def drain(self) -> tuple[FloatArray, FloatArray, int]:
         """Return pending samples in order and clear the pending ring."""
+        lock_wait_start_ns = time.perf_counter_ns()
         with self._lock:
-            count = self._count
-            dropped = self._dropped
-            self._dropped = 0
-            if count == 0:
-                return (
-                    np.empty(0, dtype=np.float64),
-                    np.empty(0, dtype=np.float64),
-                    dropped,
-                )
-
-            read_index = self._read_index
-            if read_index + count <= self._capacity:
-                timestamps = self._timestamps[read_index : read_index + count].copy()
-                values = self._values[read_index : read_index + count].copy()
-            else:
-                first_count = self._capacity - read_index
-                timestamps = np.concatenate(
-                    (
-                        self._timestamps[read_index:],
-                        self._timestamps[: count - first_count],
+            lock_acquired_ns = time.perf_counter_ns()
+            wait_ns = lock_acquired_ns - lock_wait_start_ns
+            self._drain_calls += 1
+            self._drain_lock_wait_ns_total += wait_ns
+            self._drain_lock_wait_ns_max = max(self._drain_lock_wait_ns_max, wait_ns)
+            try:
+                count = self._count
+                dropped = self._dropped
+                self._dropped = 0
+                if count == 0:
+                    return (
+                        np.empty(0, dtype=np.float64),
+                        np.empty(0, dtype=np.float64),
+                        dropped,
                     )
-                )
-                values = np.concatenate(
-                    (
-                        self._values[read_index:],
-                        self._values[: count - first_count],
-                    )
-                )
 
-            self._read_index = self._write_index
-            self._count = 0
-            return timestamps, values, dropped
+                read_index = self._read_index
+                if read_index + count <= self._capacity:
+                    timestamps = self._timestamps[read_index : read_index + count].copy()
+                    values = self._values[read_index : read_index + count].copy()
+                else:
+                    first_count = self._capacity - read_index
+                    timestamps = np.concatenate(
+                        (
+                            self._timestamps[read_index:],
+                            self._timestamps[: count - first_count],
+                        )
+                    )
+                    values = np.concatenate(
+                        (
+                            self._values[read_index:],
+                            self._values[: count - first_count],
+                        )
+                    )
+
+                self._drain_samples += count
+                self._read_index = self._write_index
+                self._count = 0
+                return timestamps, values, dropped
+            finally:
+                hold_ns = time.perf_counter_ns() - lock_acquired_ns
+                self._drain_lock_hold_ns_total += hold_ns
+                self._drain_lock_hold_ns_max = max(self._drain_lock_hold_ns_max, hold_ns)
+
+    def stats_snapshot(self) -> PendingBufferStatsSnapshot:
+        """Return cumulative buffer and lock metrics."""
+        with self._lock:
+            return PendingBufferStatsSnapshot(
+                append_calls=self._append_calls,
+                append_samples=self._append_samples,
+                append_lock_wait_ns_total=self._append_lock_wait_ns_total,
+                append_lock_wait_ns_max=self._append_lock_wait_ns_max,
+                append_lock_hold_ns_total=self._append_lock_hold_ns_total,
+                append_lock_hold_ns_max=self._append_lock_hold_ns_max,
+                drain_calls=self._drain_calls,
+                drain_samples=self._drain_samples,
+                drain_lock_wait_ns_total=self._drain_lock_wait_ns_total,
+                drain_lock_wait_ns_max=self._drain_lock_wait_ns_max,
+                drain_lock_hold_ns_total=self._drain_lock_hold_ns_total,
+                drain_lock_hold_ns_max=self._drain_lock_hold_ns_max,
+                dropped_samples=self._total_dropped,
+                high_watermark=self._high_watermark,
+            )
 
 
 class SignalRingHistory:

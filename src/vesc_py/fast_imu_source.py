@@ -89,6 +89,59 @@ class ImuSourceStats:
         )
 
 
+@dataclass(slots=True)
+class _DurationStat:
+    count: int = 0
+    total_ns: int = 0
+    max_ns: int = 0
+    last_ns: int = 0
+
+    def add(self, duration_ns: int) -> None:
+        self.count += 1
+        self.total_ns += duration_ns
+        self.max_ns = max(self.max_ns, duration_ns)
+        self.last_ns = duration_ns
+
+    @property
+    def average_ns(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total_ns / self.count
+
+
+@dataclass(slots=True)
+class _SourceProfile:
+    write_ns: _DurationStat
+    read_ns: _DurationStat
+    parse_ns: _DurationStat
+    publish_ns: _DurationStat
+    flush_ns: _DurationStat
+    loop_ns: _DurationStat
+    state_lock_wait_ns: _DurationStat
+    state_lock_hold_ns: _DurationStat
+
+
+def _new_source_profile() -> _SourceProfile:
+    return _SourceProfile(
+        write_ns=_DurationStat(),
+        read_ns=_DurationStat(),
+        parse_ns=_DurationStat(),
+        publish_ns=_DurationStat(),
+        flush_ns=_DurationStat(),
+        loop_ns=_DurationStat(),
+        state_lock_wait_ns=_DurationStat(),
+        state_lock_hold_ns=_DurationStat(),
+    )
+
+
+def _ns_to_ms(duration_ns: float) -> float:
+    return duration_ns / 1_000_000.0
+
+
+def _avg_ms(stat: _DurationStat) -> float:
+    return _ns_to_ms(stat.average_ns)
+
+
 def parse_imu_axis(text: str) -> str:
     """Parse an IMU bench axis name or alias."""
     token = text.strip().lower().replace("-", "_")
@@ -278,6 +331,7 @@ class VescImuSignalSource:
         self._latest_sample_s: float | None = None
         self._latest_value: float | None = None
         self._last_error: str | None = None
+        self._profile = _new_source_profile()
 
     @property
     def channel_name(self) -> str:
@@ -322,6 +376,7 @@ class VescImuSignalSource:
                 else 0.0
             )
             average_rate = self._sample_count / elapsed_s if elapsed_s > 0.0 else 0.0
+            debug_text = self._debug_text_locked()
             return SignalSourceSnapshot(
                 samples=self._sample_count,
                 dropped=self._dropped,
@@ -331,7 +386,44 @@ class VescImuSignalSource:
                 latest_value=self._latest_value,
                 last_error=self._last_error,
                 done=self._done.is_set(),
+                debug_text=debug_text,
             )
+
+    def _debug_text_locked(self) -> str:
+        buffer_stats = self._samples.stats_snapshot()
+        append_wait_ms = (
+            _ns_to_ms(buffer_stats.append_lock_wait_ns_total / buffer_stats.append_calls)
+            if buffer_stats.append_calls
+            else 0.0
+        )
+        append_hold_ms = (
+            _ns_to_ms(buffer_stats.append_lock_hold_ns_total / buffer_stats.append_calls)
+            if buffer_stats.append_calls
+            else 0.0
+        )
+        drain_wait_ms = (
+            _ns_to_ms(buffer_stats.drain_lock_wait_ns_total / buffer_stats.drain_calls)
+            if buffer_stats.drain_calls
+            else 0.0
+        )
+        drain_hold_ms = (
+            _ns_to_ms(buffer_stats.drain_lock_hold_ns_total / buffer_stats.drain_calls)
+            if buffer_stats.drain_calls
+            else 0.0
+        )
+        return (
+            "srcdbg "
+            f"loop={_avg_ms(self._profile.loop_ns):.3f}ms "
+            f"rd={_avg_ms(self._profile.read_ns):.3f} "
+            f"wr={_avg_ms(self._profile.write_ns):.3f} "
+            f"parse={_avg_ms(self._profile.parse_ns):.3f} "
+            f"pub={_avg_ms(self._profile.publish_ns):.3f} "
+            f"flush={_avg_ms(self._profile.flush_ns):.3f} "
+            f"state_lock={_avg_ms(self._profile.state_lock_wait_ns):.3f}/{_avg_ms(self._profile.state_lock_hold_ns):.3f} "
+            f"buf_wait a/d={append_wait_ms:.3f}/{drain_wait_ms:.3f} "
+            f"buf_hold a/d={append_hold_ms:.3f}/{drain_hold_ms:.3f} "
+            f"buf_hi={buffer_stats.high_watermark}"
+        )
 
     def _value_from_payload(self, payload: bytes) -> float:
         buf = VescBuffer(payload)
@@ -368,6 +460,7 @@ class VescImuSignalSource:
                 timeout=self._timeout,
             )
             while not self._stop.is_set():
+                loop_start_ns = time.perf_counter_ns()
                 serial_port = self._serial_port
                 if serial_port is None:
                     break
@@ -381,41 +474,64 @@ class VescImuSignalSource:
                         break
 
                 previous_request_ns = time.perf_counter_ns()
+                write_start_ns = previous_request_ns
                 serial_port.write(self._request)
+                after_write_ns = time.perf_counter_ns()
+                self._profile.write_ns.add(after_write_ns - write_start_ns)
 
+                read_start_ns = after_write_ns
                 payload = _read_expected_imu_packet(
                     serial_port,
                     self._timeout,
                     self._stats,
                 )
                 now_ns = time.perf_counter_ns()
+                self._profile.read_ns.add(now_ns - read_start_ns)
                 if payload is None:
                     self._stats.timeouts += 1
                     serial_port.reset_input_buffer()
+                    self._profile.loop_ns.add(time.perf_counter_ns() - loop_start_ns)
                     continue
 
                 try:
+                    parse_start_ns = time.perf_counter_ns()
                     value = self._value_from_payload(payload)
+                    self._profile.parse_ns.add(time.perf_counter_ns() - parse_start_ns)
                 except ValueError as exc:
                     self._stats.parse_errors += 1
                     with self._lock:
                         self._last_error = str(exc)
+                    self._profile.loop_ns.add(time.perf_counter_ns() - loop_start_ns)
                     continue
 
                 sample_s = (now_ns - self._start_ns) / NSEC_PER_SEC
                 pending_timestamps.append(sample_s)
                 pending_values.append(value)
+                state_lock_wait_start_ns = time.perf_counter_ns()
                 with self._lock:
+                    state_lock_acquired_ns = time.perf_counter_ns()
+                    self._profile.state_lock_wait_ns.add(
+                        state_lock_acquired_ns - state_lock_wait_start_ns
+                    )
                     self._sample_count += 1
                     self._latest_sample_s = sample_s
                     self._latest_value = value
                     self._last_error = None
+                    state_lock_hold_ns = time.perf_counter_ns() - state_lock_acquired_ns
+                    self._profile.state_lock_hold_ns.add(state_lock_hold_ns)
+
+                publish_end_ns = time.perf_counter_ns()
+                self._profile.publish_ns.add(publish_end_ns - now_ns)
 
                 if len(pending_timestamps) >= 64 or now_ns >= next_flush_ns:
+                    flush_start_ns = time.perf_counter_ns()
                     self._samples.append_many(pending_timestamps, pending_values)
+                    flush_end_ns = time.perf_counter_ns()
+                    self._profile.flush_ns.add(flush_end_ns - flush_start_ns)
                     pending_timestamps.clear()
                     pending_values.clear()
                     next_flush_ns = now_ns + 5_000_000
+                self._profile.loop_ns.add(time.perf_counter_ns() - loop_start_ns)
         except Exception as exc:  # noqa: BLE001 - source errors are surfaced in status.
             with self._lock:
                 self._stats.parse_errors += 1

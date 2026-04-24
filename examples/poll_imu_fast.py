@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -95,6 +96,63 @@ class PollStats:
     parse_errors: int = 0
 
 
+@dataclass(slots=True)
+class DurationStat:
+    """Simple cumulative duration bucket."""
+
+    count: int = 0
+    total_ns: int = 0
+    max_ns: int = 0
+    last_ns: int = 0
+
+    def add(self, duration_ns: int) -> None:
+        self.count += 1
+        self.total_ns += duration_ns
+        self.max_ns = max(self.max_ns, duration_ns)
+        self.last_ns = duration_ns
+
+    @property
+    def average_ns(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.total_ns / self.count
+
+
+@dataclass(slots=True)
+class PollProfile:
+    """Average timing buckets for the fast poller hot path."""
+
+    loop_ns: DurationStat
+    read_ns: DurationStat
+    write_ns: DurationStat
+    parse_ns: DurationStat
+
+
+def new_poll_profile() -> PollProfile:
+    """Build empty timing buckets for the poller hot path."""
+    return PollProfile(
+        loop_ns=DurationStat(),
+        read_ns=DurationStat(),
+        write_ns=DurationStat(),
+        parse_ns=DurationStat(),
+    )
+
+
+def average_ms(stat: DurationStat) -> float:
+    """Return the average duration in milliseconds for one bucket."""
+    return stat.average_ns / 1_000_000.0
+
+
+def profile_lines(profile: PollProfile) -> list[str]:
+    """Return timing lines matching the YALSA source debug layout."""
+    return [
+        f"srcdbg: loop={average_ms(profile.loop_ns):.3f}ms",
+        f"srcdbg: rd={average_ms(profile.read_ns):.3f}",
+        f"srcdbg: wr={average_ms(profile.write_ns):.3f}",
+        f"srcdbg: parse={average_ms(profile.parse_ns):.3f}",
+    ]
+
+
 @dataclass(frozen=True, slots=True)
 class ParsedImu:
     """A decoded COMM_GET_IMU_DATA payload."""
@@ -144,6 +202,7 @@ class TerminalImuDisplay:
         parsed: ParsedImu,
         poll_stats: PollStats,
         reader_stats: ReaderStats,
+        profile: PollProfile | None = None,
         current_rate: float,
         average_rate: float,
     ) -> None:
@@ -170,9 +229,10 @@ class TerminalImuDisplay:
             ),
             f"timing: {HOST_RX_TIMESTAMP_SOURCE}   sample_age: {age_ms:.2f} ms",
             f"vesc_id: {vesc_id}   rx_mask: 0x{parsed.mask:04x}",
-            "",
-            "IMU values",
         ]
+        if profile is not None:
+            lines.extend(profile_lines(profile))
+        lines.extend(["", "IMU values"])
         lines.extend(
             f"{name:<8} {value:>16.8g}" for name, value in zip(names, parsed.values)
         )
@@ -377,15 +437,25 @@ def build_parser() -> argparse.ArgumentParser:
             "When omitted, polling runs as fast as responses arrive."
         ),
     )
+    parser.add_argument(
+        "--worker-thread",
+        action="store_true",
+        help="Run the poll loop on a background threading.Thread for comparison.",
+    )
     return parser
 
 
-def wait_until_ns(deadline_ns: int) -> None:
+def wait_until_ns(
+    deadline_ns: int,
+    stop_event: threading.Event | None = None,
+) -> bool:
     """Wait until *deadline_ns* using coarse sleep plus a short busy-spin."""
     while True:
+        if stop_event is not None and stop_event.is_set():
+            return False
         remaining_ns = deadline_ns - time.perf_counter_ns()
         if remaining_ns <= 0:
-            return
+            return True
         if remaining_ns > RATE_LIMIT_SLEEP_SLACK_NS:
             sleep_s = (remaining_ns - RATE_LIMIT_SLEEP_SLACK_NS) / NSEC_PER_SEC
             time.sleep(min(sleep_s, 0.01))
@@ -401,6 +471,7 @@ def poll_imu(
     status_interval: float = DEFAULT_STATUS_INTERVAL,
     tui: TerminalImuDisplay | None = None,
     max_samples: int = 0,
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Run the high-rate IMU polling loop."""
     if poll_rate_hz is not None and poll_rate_hz <= 0.0:
@@ -408,6 +479,7 @@ def poll_imu(
 
     reader_stats = ReaderStats()
     poll_stats = PollStats()
+    profile = new_poll_profile()
     start_ns = time.perf_counter_ns()
     previous_sample_ns: int | None = None
     previous_request_ns: int | None = None
@@ -425,32 +497,45 @@ def poll_imu(
         tui.start()
 
     try:
-        while max_samples <= 0 or poll_stats.samples < max_samples:
+        while (
+            (stop_event is None or not stop_event.is_set())
+            and (max_samples <= 0 or poll_stats.samples < max_samples)
+        ):
+            loop_start_ns = time.perf_counter_ns()
             if poll_interval_ns is not None and previous_request_ns is not None:
                 next_request_ns = previous_request_ns + poll_interval_ns
-                wait_until_ns(next_request_ns)
+                if not wait_until_ns(next_request_ns, stop_event):
+                    break
 
             previous_request_ns = time.perf_counter_ns()
+            write_start_ns = previous_request_ns
             serial_port.write(request)
+            profile.write_ns.add(time.perf_counter_ns() - write_start_ns)
             poll_stats.requests += 1
 
+            read_start_ns = time.perf_counter_ns()
             payload = read_expected_imu_packet(
                 serial_port,
                 packet_timeout,
                 reader_stats,
             )
             now_ns = time.perf_counter_ns()
+            profile.read_ns.add(now_ns - read_start_ns)
             if payload is None:
                 poll_stats.timeouts += 1
                 serial_port.reset_input_buffer()
+                profile.loop_ns.add(time.perf_counter_ns() - loop_start_ns)
                 continue
 
             status_window_samples += 1
             try:
+                parse_start_ns = time.perf_counter_ns()
                 latest = parse_imu_payload(payload)
+                profile.parse_ns.add(time.perf_counter_ns() - parse_start_ns)
             except ValueError as exc:
                 poll_stats.parse_errors += 1
                 print(f"parse error: {exc}", file=status_stream)
+                profile.loop_ns.add(time.perf_counter_ns() - loop_start_ns)
                 continue
 
             poll_stats.samples += 1
@@ -472,6 +557,7 @@ def poll_imu(
                     parsed=latest,
                     poll_stats=poll_stats,
                     reader_stats=reader_stats,
+                    profile=profile,
                     current_rate=current_rate,
                     average_rate=average_rate,
                 )
@@ -494,10 +580,12 @@ def poll_imu(
                 )
                 if latest is not None:
                     status += "  " + format_values(latest.mask, latest.values)
+                status += "  " + "  ".join(profile_lines(profile))
                 print(status, file=status_stream)
                 status_window_ns = now_ns
                 status_window_samples = 0
                 next_status_ns = now_ns + round(status_interval * NSEC_PER_SEC)
+            profile.loop_ns.add(time.perf_counter_ns() - loop_start_ns)
     except KeyboardInterrupt:
         print("\nInterrupted.", file=status_stream)
     finally:
@@ -511,9 +599,70 @@ def poll_imu(
             f"timeouts={poll_stats.timeouts} parse_errors={poll_stats.parse_errors} "
             f"discarded={reader_stats.discarded_bytes} bad_crc={reader_stats.bad_crc} "
             f"bad_stop={reader_stats.bad_stop} invalid_length={reader_stats.invalid_length} "
-            f"unexpected={reader_stats.unexpected_packets}",
+            f"unexpected={reader_stats.unexpected_packets} "
+            f"srcdbg_loop={average_ms(profile.loop_ns):.3f}ms "
+            f"srcdbg_rd={average_ms(profile.read_ns):.3f} "
+            f"srcdbg_wr={average_ms(profile.write_ns):.3f} "
+            f"srcdbg_parse={average_ms(profile.parse_ns):.3f}",
             file=status_stream,
         )
+
+
+def run_poll_imu_in_worker_thread(
+    serial_port: PollIo,
+    *,
+    request: bytes,
+    packet_timeout: float,
+    poll_rate_hz: float | None = None,
+    status_stream: TextIO = sys.stderr,
+    status_interval: float = DEFAULT_STATUS_INTERVAL,
+    tui: TerminalImuDisplay | None = None,
+    max_samples: int = 0,
+) -> None:
+    """Run ``poll_imu`` on a worker thread without introducing Qt."""
+    stop_event = threading.Event()
+    worker_error: BaseException | None = None
+
+    def worker_main() -> None:
+        nonlocal worker_error
+        try:
+            poll_imu(
+                serial_port,
+                request=request,
+                packet_timeout=packet_timeout,
+                poll_rate_hz=poll_rate_hz,
+                status_stream=status_stream,
+                status_interval=status_interval,
+                tui=tui,
+                max_samples=max_samples,
+                stop_event=stop_event,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            worker_error = exc
+
+    worker = threading.Thread(
+        target=worker_main,
+        name="vesc-imu-fast-poller",
+        daemon=True,
+    )
+    worker.start()
+
+    try:
+        while worker.is_alive():
+            worker.join(timeout=0.1)
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=status_stream)
+        stop_event.set()
+        worker.join(timeout=packet_timeout + 0.2)
+
+    if worker.is_alive():
+        serial_port.close()
+        worker.join(timeout=packet_timeout + 0.2)
+
+    if worker_error is not None:
+        if stop_event.is_set() and isinstance(worker_error, (OSError, ValueError)):
+            return
+        raise worker_error
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -549,13 +698,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         f"Opening {link_label}; mask=0x{DEFAULT_MASK:04x} ({fields}); "
         f"display={display}; poll_rate="
         f"{'max' if args.poll_rate is None else f'<= {args.poll_rate:g} Hz'}"
+        f"; mode={'worker-thread' if args.worker_thread else 'main-thread'}"
         f"{target_label}",
         file=sys.stderr,
     )
     print(HOST_RX_TIMING_NOTICE, file=sys.stderr)
 
     try:
-        poll_imu(
+        runner = run_poll_imu_in_worker_thread if args.worker_thread else poll_imu
+        runner(
             serial_port,
             request=request,
             packet_timeout=DEFAULT_TIMEOUT,
