@@ -1,5 +1,6 @@
 import argparse
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -24,8 +25,8 @@ from examples.poll_imu_fast import (
     write_csv_header,
     write_sample,
 )
-from vesc_py import BleDevice
 from vesc_py.comm_ids import CommPacketId
+from vesc_py.connection import VescConnection, VescTarget
 from vesc_py.packet import encode_packet
 
 
@@ -95,37 +96,30 @@ def test_build_imu_request_wraps_can_forwarding() -> None:
 def test_open_poll_connection_uses_ble_options(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    parser = build_parser()
-    args = parser.parse_args(
-        [
-            "--ble",
+    target = VescTarget(
+        connection=VescConnection.ble(
             "AA:BB:CC:DD:EE:FF",
-            "--timeout",
-            "1.5",
-            "--ble-connect-timeout",
-            "2.5",
-            "--ble-chunk-size",
-            "64",
-        ]
+            connect_timeout=2.5,
+            chunk_size=64,
+        )
     )
     fake_transport = object()
     calls: dict[str, object] = {}
 
-    def fake_open_ble(address: str, **kwargs: object) -> object:
-        calls["address"] = address
-        calls.update(kwargs)
+    def fake_open_blocking_io(connection: VescConnection, *, timeout: float) -> object:
+        calls["connection"] = connection
+        calls["timeout"] = timeout
         return fake_transport
 
-    monkeypatch.setattr("examples.poll_imu_fast.open_ble", fake_open_ble)
+    monkeypatch.setattr("examples.poll_imu_fast.open_blocking_io", fake_open_blocking_io)
 
-    transport, label = open_poll_connection(args)
+    transport, label = open_poll_connection(target, timeout=1.5)
 
     assert transport is fake_transport
     assert label == "AA:BB:CC:DD:EE:FF"
     assert calls == {
-        "address": "AA:BB:CC:DD:EE:FF",
-        "connect_timeout": 2.5,
-        "chunk_size": 64,
+        "connection": target.connection,
+        "timeout": 1.5,
     }
 
 
@@ -133,20 +127,41 @@ def test_scan_and_print_ble_lists_discovered_devices(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    def fake_ble_scan(timeout: float) -> list[BleDevice]:
-        assert timeout == 0.25
+    parser = build_parser()
+    args = parser.parse_args(["--scan-ble", "--ble-scan-timeout", "0.25"])
+
+    def fake_discover_connection_candidates(
+        parsed_args: argparse.Namespace,
+        *,
+        output_stream: object,
+    ) -> list[SimpleNamespace]:
+        assert parsed_args is args
         return [
-            BleDevice(name="VESC BLE", address="AA:BB:CC:DD:EE:FF", rssi=-51),
-            BleDevice(name="", address="11:22:33:44:55:66", rssi=None),
+            SimpleNamespace(
+                connection=VescConnection.serial("/dev/ttyACM0"),
+                label="Serial [vesc]: /dev/ttyACM0",
+            ),
+            SimpleNamespace(
+                connection=VescConnection.ble("AA:BB:CC:DD:EE:FF"),
+                label="BLE: VESC BLE | AA:BB:CC:DD:EE:FF | RSSI -51 dBm",
+            ),
+            SimpleNamespace(
+                connection=VescConnection.ble("11:22:33:44:55:66"),
+                label="BLE: (unnamed) | 11:22:33:44:55:66",
+            ),
         ]
 
-    monkeypatch.setattr("examples.poll_imu_fast.ble_scan", fake_ble_scan)
+    monkeypatch.setattr(
+        "examples.poll_imu_fast.discover_connection_candidates",
+        fake_discover_connection_candidates,
+    )
 
-    scan_and_print_ble(timeout=0.25)
+    scan_and_print_ble(args)
 
     output = capsys.readouterr().out
-    assert "VESC BLE  AA:BB:CC:DD:EE:FF  RSSI -51 dBm" in output
-    assert "(unnamed)  11:22:33:44:55:66" in output
+    assert "Scanning for VESC BLE devices for 0.25s ..." in output
+    assert "BLE: VESC BLE | AA:BB:CC:DD:EE:FF | RSSI -51 dBm" in output
+    assert "BLE: (unnamed) | 11:22:33:44:55:66" in output
 
 
 def test_csv_header_labels_host_receive_timing(capsys: pytest.CaptureFixture[str]) -> None:
