@@ -93,6 +93,7 @@ class SignalBatchSourceSnapshot:
     latest_values: Mapping[str, float]
     last_error: str | None
     done: bool
+    debug_text: str | None = None
 
 
 class SignalBatchSource(Protocol):
@@ -157,6 +158,7 @@ def _scalar_snapshot_to_batch(
         latest_values=dict(latest_values),
         last_error=snapshot.last_error,
         done=snapshot.done,
+        debug_text=snapshot.debug_text,
     )
 
 
@@ -872,7 +874,14 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
                     continue
                 decimated = _decimate_series(series, plot_spec.max_points)
                 curve.setData(decimated.x, decimated.y)
-            plot_item.autoRange()
+                x_bounds = _merge_bounds(x_bounds, _finite_bounds(decimated.x))
+                y_bounds = _merge_bounds(y_bounds, _finite_bounds(decimated.y))
+            _update_plot_ranges(
+                plot_item,
+                range_tracker,
+                x_bounds=x_bounds,
+                y_bounds=y_bounds,
+            )
 
         snapshot = analysis_input.snapshot
         parts = [
@@ -883,6 +892,8 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
             f"errors: {snapshot.errors}",
             f"latest: {_format_latest_values(snapshot, config.source.channels)}",
         ]
+        if snapshot.debug_text:
+            parts.append(snapshot.debug_text)
         if snapshot.last_error:
             parts.append(f"source error: {snapshot.last_error}")
         if last_process_error:

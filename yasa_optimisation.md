@@ -158,3 +158,161 @@ srcdbg: a/d=0.001/0.004
 srcdbg: buf_hold
 srcdbg: a/d=0.012/0.062
 srcdbg: buf_hi=1387
+
+## Additional Code Finding
+
+After the headless run confirmed that `VescImuSignalSource` itself is not the
+bottleneck, the remaining live-analysis path was reviewed again.
+
+`src/yalsa/app.py` already had the start of a plot-range optimisation:
+
+- `_PlotRangeTracker`
+- `_finite_bounds`
+- `_merge_bounds`
+- `_update_plot_ranges`
+- `disableAutoRange()`
+
+But `refresh()` was still calling `plot_item.autoRange()` on every update, and
+the computed `x_bounds` / `y_bounds` values were never applied.
+
+That means the intended range-tracking optimisation was effectively inactive in
+the live Qt/YALSA path.
+
+## Current Hypothesis
+
+The most concrete remaining suspect is now repeated PyQtGraph/Qt plot
+auto-ranging and the repaint work it triggers. That work would exist only in
+the live GUI path, not in the headless source bench, and some of it can happen
+outside the measured `refresh()` callback timing.
+
+## Change Made
+
+`src/yalsa/app.py` now:
+
+- stops calling `plot_item.autoRange()` every refresh
+- computes explicit x/y bounds from the visible decimated series
+- applies range updates only when the bounds materially change
+
+`src/yalsa/app.py` and `ScalarSignalSourceAdapter` also now carry scalar
+`debug_text` through the batch-source path again so live YALSA runs can expose
+`srcdbg` metrics in the status label.
+
+## Result After Change
+
+The first live rerun still reported roughly the same source rate:
+
+- `source: 342.3 Hz`
+- `history: 342.6 Hz`
+- `samples: 2574`
+- `dropped: 0`
+- `errors: 1`
+
+So disabling per-refresh plot auto-range was not enough to recover the missing
+throughput by itself.
+
+## Headless YALSA Timer Result
+
+Running the YALSA timer/history path without Qt and without the DSP callback:
+
+- `nix develop -c uv run examples/headless_yalsa_analysis.py --serial /dev/ttyACM0 --mode noop`
+
+produced:
+
+- `source: 1424.1 Hz`
+- `history: 1417.5 Hz`
+- `srcdbg: loop=0.701ms`
+- `srcdbg: rd=0.614`
+- `srcdbg: wr=0.071`
+- `uidbg: tot=0.151`
+- `uidbg: drain=0.038`
+- `uidbg: hist=0.015`
+- `uidbg: snap=0.090`
+- `uidbg: proc=0.001`
+
+That rules out:
+
+- the source worker thread
+- the 15 Hz refresh schedule by itself
+- the pending/history buffer path
+- basic non-Qt status bookkeeping
+
+So the remaining suspects are now:
+
+- the actual YALSA DSP callback
+- the Qt/PyQtGraph runtime
+
+Synthetic local measurement of the full YALSA processor on a 4096-sample window
+was only a few milliseconds per refresh, which makes the GUI/render side the
+stronger suspect.
+
+## Protocol Result
+
+For the protocol runs, all three non-plot variants stayed fast on hardware:
+
+- `examples/headless_yalsa_analysis.py --mode noop`
+- `examples/headless_yalsa_analysis.py --mode full`
+- `examples/qt_yalsa_status_only.py --mode full`
+
+That means the following paths are all fast enough:
+
+- the source worker thread
+- the non-Qt timer/history path
+- the full YALSA DSP callback
+- the Qt event loop plus simple status-label updates
+
+## Current Conclusion
+
+The remaining bottleneck is therefore in the full live GUI path, specifically
+the Qt/PyQtGraph plot/widget update and render path used by
+`examples/yalsa/live_signal_analysis.py`.
+
+## Changes Added During This Investigation
+
+- `examples/headless_fast_imu_source.py`
+  - isolates `VescImuSignalSource` from the GUI stack
+- `examples/headless_yalsa_analysis.py`
+  - runs the YALSA timer/history/process loop without Qt/PyQtGraph
+- `examples/qt_yalsa_status_only.py`
+  - runs the YALSA timer/history/process loop under Qt without plot widgets
+- `src/yalsa/app.py`
+  - restored scalar `debug_text` propagation into the batch-source status path
+  - fixed the unfinished plot-range optimisation so per-refresh `autoRange()`
+    is no longer called
+
+## Next Step
+
+The next isolation steps are:
+
+1. Run the same YALSA source and DSP callback without Qt/PyQtGraph:
+
+- `uv run examples/headless_yalsa_analysis.py --serial /dev/ttyACM0 --mode noop`
+- `uv run examples/headless_yalsa_analysis.py --serial /dev/ttyACM0 --mode full`
+
+Interpretation:
+
+- if `noop` stays fast and `full` drops, the bottleneck is in the YALSA
+  analysis/history path or GIL pressure from DSP work
+- if both stay fast, the remaining bottleneck is in Qt/PyQtGraph rendering or
+  event-loop side effects
+
+2. Run the same YALSA source and DSP callback under a real Qt event loop but
+   without PyQtGraph plots:
+
+- `uv run examples/qt_yalsa_status_only.py --serial /dev/ttyACM0 --mode noop`
+- `uv run examples/qt_yalsa_status_only.py --serial /dev/ttyACM0 --mode full`
+
+Interpretation:
+
+- if Qt status-only stays fast, the remaining culprit is specifically the
+  PyQtGraph plot/widget update path
+- if Qt status-only drops while headless full stays fast, the culprit is Qt
+  event-loop / QWidget / label-update side effects rather than the DSP callback
+
+3. Re-run `examples/yalsa/live_signal_analysis.py` and compare:
+
+- `source`
+- `srcdbg: loop`
+- `srcdbg: rd`
+- `srcdbg: wr`
+
+against the earlier `374.6 Hz` / `2.666 ms` live-analysis result.
