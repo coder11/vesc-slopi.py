@@ -20,6 +20,9 @@ import time
 from collections.abc import Sequence
 from typing import TextIO
 
+import numpy as np
+import numpy.typing as npt
+
 from vesc_py.connection_cli import (
     add_vesc_connection_arguments,
     resolve_vesc_target_from_args,
@@ -59,14 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def drained_rate_hz(timestamps_s: Sequence[float]) -> float | None:
+def drained_rate_hz(timestamps_s: npt.ArrayLike) -> float | None:
     """Estimate the sample rate from one drained batch of timestamps."""
-    if len(timestamps_s) < 2:
+    timestamps = np.asarray(timestamps_s, dtype=np.float64)
+    if int(timestamps.size) < 2:
         return None
-    elapsed_s = float(timestamps_s[-1] - timestamps_s[0])
+    elapsed_s = float(timestamps[-1] - timestamps[0])
     if elapsed_s <= 0.0:
         return None
-    return (len(timestamps_s) - 1) / elapsed_s
+    return (int(timestamps.size) - 1) / elapsed_s
 
 
 def expand_debug_text(text: str) -> list[str]:

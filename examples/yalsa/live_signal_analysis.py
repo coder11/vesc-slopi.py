@@ -12,6 +12,7 @@ Examples:
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -362,7 +363,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     config = build_runtime_config()
     vesc_target = None
     if config.source == DEFAULT_SOURCE:
-        vesc_argv = () if argv is None else tuple(argv)
+        vesc_argv = tuple(sys.argv[1:] if argv is None else argv)
         vesc_target = run_vesc_connection_cli(
             (*vesc_argv, "--timeout", str(config.timeout))
         )

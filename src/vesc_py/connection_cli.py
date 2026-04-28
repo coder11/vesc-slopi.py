@@ -379,7 +379,7 @@ def _can_connect(connection: VescConnection, *, timeout: float, output_stream: T
     client: VescClient | None = None
     try:
         client = connect_client(connection, timeout=timeout)
-    except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
+    except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught
         print(
             f"Cached connection failed ({connection.describe()}): {exc}. Falling back to discovery.",
             file=output_stream,

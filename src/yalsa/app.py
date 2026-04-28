@@ -5,6 +5,8 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import cycle
@@ -20,6 +22,11 @@ ParamValue: TypeAlias = int | float | bool | str
 PlotColor: TypeAlias = str | tuple[int, int, int]
 
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+NSEC_PER_SEC = 1_000_000_000
+MAX_GUI_PLOT_RATE_HZ = 60.0
+_ANALYSIS_IDLE_SLEEP_S = 0.001
+_WORKER_STATUS_INTERVAL_NS = 50_000_000
+_MAX_THREAD_SWITCH_INTERVAL_S = 0.001
 
 
 def _empty_array() -> FloatArray:
@@ -596,6 +603,186 @@ class _PlotRangeTracker:
     y_bounds: tuple[float, float] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class _AnalysisWorkerSnapshot:
+    result: AnalysisResult | None
+    process_error: str | None
+    source_snapshot: SignalBatchSourceSnapshot
+    history_rate_hz: float | None
+    processing_rate_hz: float | None
+    last_process_ms: float | None
+
+
+class _LiveAnalysisWorker:
+    """Drain, retain, and process source samples outside the Qt GUI thread."""
+
+    def __init__(
+        self,
+        config: LiveAnalysisApp,
+        parameter_values: Mapping[str, ParamValue],
+    ) -> None:
+        self._config = config
+        self._history = SignalBatchHistory(config.history, config.source.channels)
+        self._parameter_values = dict(parameter_values)
+        self._parameter_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._clear_requested = threading.Event()
+        self._process_requested = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._source_started = False
+        self._last_result: AnalysisResult | None = None
+        self._last_process_error: str | None = None
+        self._source_snapshot = config.source.snapshot()
+        self._history_rate_hz: float | None = None
+        self._process_start_ns = 0
+        self._process_count = 0
+        self._last_process_ns: int | None = None
+        self._last_status_update_ns = 0
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._clear_requested.clear()
+            self._process_requested.clear()
+            with self._state_lock:
+                self._last_result = None
+                self._last_process_error = None
+                self._source_snapshot = self._config.source.snapshot()
+                self._history_rate_hz = None
+                self._process_start_ns = time.perf_counter_ns()
+                self._process_count = 0
+                self._last_process_ns = None
+            self._config.source.start()
+            self._source_started = True
+            self._thread = threading.Thread(
+                target=self._run,
+                name="yalsa-analysis-worker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        with self._lifecycle_lock:
+            self._stop.set()
+            if self._source_started:
+                self._config.source.stop(timeout=timeout)
+                self._source_started = False
+            thread = self._thread
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+    def set_parameter(self, name: str, value: ParamValue) -> None:
+        with self._parameter_lock:
+            if name not in self._parameter_values:
+                raise KeyError(f"unknown parameter {name!r}")
+            self._parameter_values[name] = value
+        self._process_requested.set()
+
+    def clear_history(self) -> None:
+        self._clear_requested.set()
+        self._process_requested.set()
+        with self._state_lock:
+            self._last_result = None
+            self._last_process_error = None
+            self._history_rate_hz = None
+
+    def snapshot(self) -> _AnalysisWorkerSnapshot:
+        with self._state_lock:
+            elapsed_s = (
+                (time.perf_counter_ns() - self._process_start_ns) / NSEC_PER_SEC
+                if self._process_start_ns > 0
+                else 0.0
+            )
+            processing_rate = (
+                self._process_count / elapsed_s
+                if self._process_count > 0 and elapsed_s > 0.0
+                else None
+            )
+            last_process_ms = (
+                None
+                if self._last_process_ns is None
+                else self._last_process_ns / 1_000_000.0
+            )
+            return _AnalysisWorkerSnapshot(
+                result=self._last_result,
+                process_error=self._last_process_error,
+                source_snapshot=self._source_snapshot,
+                history_rate_hz=self._history_rate_hz,
+                processing_rate_hz=processing_rate,
+                last_process_ms=last_process_ms,
+            )
+
+    def _parameter_snapshot(self) -> dict[str, ParamValue]:
+        with self._parameter_lock:
+            return dict(self._parameter_values)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if self._clear_requested.is_set():
+                    self._clear_requested.clear()
+                    self._history.clear()
+
+                batch, _dropped = self._config.source.drain()
+                has_new_samples = batch.sample_count > 0
+                if has_new_samples:
+                    self._history.append_batch(batch)
+
+                forced_process = self._process_requested.is_set()
+                if forced_process:
+                    self._process_requested.clear()
+
+                if has_new_samples or forced_process:
+                    self._process_latest()
+                else:
+                    self._update_source_status_if_due()
+                    self._stop.wait(_ANALYSIS_IDLE_SLEEP_S)
+        except Exception as exc:  # noqa: BLE001 - worker errors are surfaced in UI.
+            with self._state_lock:
+                self._last_process_error = f"analysis worker error: {exc}"
+
+    def _process_latest(self) -> None:
+        history_rate_hz = self._history.sample_hz()
+        source_snapshot = self._config.source.snapshot()
+        analysis_input = AnalysisInput(
+            batch=self._history.snapshot(),
+            sample_rate_hz=history_rate_hz,
+            snapshot=source_snapshot,
+        )
+        process_start_ns = time.perf_counter_ns()
+        try:
+            result = self._config.process(analysis_input, self._parameter_snapshot())
+        except Exception as exc:  # noqa: BLE001 - analysis errors are surfaced in UI.
+            result = None
+            process_error: str | None = str(exc)
+        else:
+            process_error = None
+        process_ns = time.perf_counter_ns() - process_start_ns
+
+        with self._state_lock:
+            if process_error is None:
+                self._last_result = result
+            self._last_process_error = process_error
+            self._source_snapshot = source_snapshot
+            self._history_rate_hz = history_rate_hz
+            self._process_count += 1
+            self._last_process_ns = process_ns
+
+    def _update_source_status_if_due(self) -> None:
+        now_ns = time.perf_counter_ns()
+        if now_ns - self._last_status_update_ns < _WORKER_STATUS_INTERVAL_NS:
+            return
+        self._last_status_update_ns = now_ns
+        with self._state_lock:
+            self._source_snapshot = self._config.source.snapshot()
+            self._history_rate_hz = self._history.sample_hz()
+
+
 def prefer_qt_xcb_platform() -> None:
     """Prefer Qt's XCB backend when Linux exposes a Wayland/X11 fallback chain."""
     if (
@@ -644,6 +831,12 @@ def require_qt_platform_runtime() -> None:
         )
 
 
+def _prefer_responsive_thread_switching() -> None:
+    """Keep GUI-side Python work from monopolising the GIL for source polling."""
+    if sys.getswitchinterval() > _MAX_THREAD_SWITCH_INTERVAL_S:
+        sys.setswitchinterval(_MAX_THREAD_SWITCH_INTERVAL_S)
+
+
 def _decimate_series(series: SeriesData, max_points: int | None) -> SeriesData:
     if max_points is None or int(series.x.size) <= max_points:
         return series
@@ -653,6 +846,10 @@ def _decimate_series(series: SeriesData, max_points: int | None) -> SeriesData:
 
 def _format_rate(value: float | None) -> str:
     return "measuring" if value is None else f"{value:.1f} Hz"
+
+
+def _format_duration_ms(value: float | None) -> str:
+    return "measuring" if value is None else f"{value:.3f} ms"
 
 
 def _format_latest_values(
@@ -727,6 +924,7 @@ def _update_plot_ranges(
 
 def run_live_analysis(config: LiveAnalysisApp) -> None:
     """Run the generic live-analysis GUI until the Qt app exits."""
+    _prefer_responsive_thread_switching()
     selected_theme = PLOT_THEMES[config.theme]
     pg, QtCore, QtWidgets = import_pyqtgraph()
     require_qt_platform_runtime()
@@ -767,6 +965,7 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
 
     controls.addSpacing(12)
     parameter_values = default_parameter_values(config.parameters)
+    analysis_worker = _LiveAnalysisWorker(config, parameter_values)
     parameter_widgets: dict[str, Any] = {}
     for parameter in config.parameters:
         controls.addWidget(QtWidgets.QLabel(parameter.label))
@@ -774,6 +973,7 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
             parameter,
             parameter_values,
             QtWidgets=QtWidgets,
+            on_change=analysis_worker.set_parameter,
         )
         parameter_widgets[parameter.name] = widget
         controls.addWidget(widget)
@@ -835,58 +1035,49 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
         plot_curves.append(curves)
         plot_range_trackers.append(_PlotRangeTracker())
 
-    history = SignalBatchHistory(config.history, config.source.channels)
-    last_result: AnalysisResult | None = None
-    last_process_error: str | None = None
-    source_started = False
+    rendered_result: AnalysisResult | None = None
 
     def refresh() -> None:
-        nonlocal last_result, last_process_error
-        batch, _dropped = config.source.drain()
-        history.append_batch(batch)
-        analysis_input = AnalysisInput(
-            batch=history.snapshot(),
-            sample_rate_hz=history.sample_hz(),
-            snapshot=config.source.snapshot(),
-        )
-        try:
-            result = config.process(analysis_input, parameter_values)
-        except Exception as exc:  # noqa: BLE001 - analysis errors are surfaced in UI.
-            last_process_error = str(exc)
-        else:
-            last_result = result
-            last_process_error = None
+        nonlocal rendered_result
+        worker_snapshot = analysis_worker.snapshot()
+        if worker_snapshot.result is not rendered_result:
+            rendered_result = worker_snapshot.result
+            for plot_spec, plot_item, curves, range_tracker in zip(
+                config.plots,
+                plot_items,
+                plot_curves,
+                plot_range_trackers,
+                strict=True,
+            ):
+                x_bounds: tuple[float, float] | None = None
+                y_bounds: tuple[float, float] | None = None
+                for trace in plot_spec.traces:
+                    series = (
+                        None
+                        if worker_snapshot.result is None
+                        else worker_snapshot.result.series.get(trace.series)
+                    )
+                    curve = curves[trace.series]
+                    if series is None:
+                        curve.setData(_empty_array(), _empty_array())
+                        continue
+                    decimated = _decimate_series(series, plot_spec.max_points)
+                    curve.setData(decimated.x, decimated.y)
+                    x_bounds = _merge_bounds(x_bounds, _finite_bounds(decimated.x))
+                    y_bounds = _merge_bounds(y_bounds, _finite_bounds(decimated.y))
+                _update_plot_ranges(
+                    plot_item,
+                    range_tracker,
+                    x_bounds=x_bounds,
+                    y_bounds=y_bounds,
+                )
 
-        for plot_spec, plot_item, curves, range_tracker in zip(
-            config.plots,
-            plot_items,
-            plot_curves,
-            plot_range_trackers,
-            strict=True,
-        ):
-            x_bounds: tuple[float, float] | None = None
-            y_bounds: tuple[float, float] | None = None
-            for trace in plot_spec.traces:
-                series = None if last_result is None else last_result.series.get(trace.series)
-                curve = curves[trace.series]
-                if series is None:
-                    curve.setData(_empty_array(), _empty_array())
-                    continue
-                decimated = _decimate_series(series, plot_spec.max_points)
-                curve.setData(decimated.x, decimated.y)
-                x_bounds = _merge_bounds(x_bounds, _finite_bounds(decimated.x))
-                y_bounds = _merge_bounds(y_bounds, _finite_bounds(decimated.y))
-            _update_plot_ranges(
-                plot_item,
-                range_tracker,
-                x_bounds=x_bounds,
-                y_bounds=y_bounds,
-            )
-
-        snapshot = analysis_input.snapshot
+        snapshot = worker_snapshot.source_snapshot
         parts = [
             f"source: {_format_rate(snapshot.average_rate_hz)}",
-            f"history: {_format_rate(analysis_input.sample_rate_hz)}",
+            f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
+            f"processing: {_format_rate(worker_snapshot.processing_rate_hz)}",
+            f"proc: {_format_duration_ms(worker_snapshot.last_process_ms)}",
             f"samples: {snapshot.samples}",
             f"dropped: {snapshot.dropped}",
             f"errors: {snapshot.errors}",
@@ -896,35 +1087,31 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
             parts.append(snapshot.debug_text)
         if snapshot.last_error:
             parts.append(f"source error: {snapshot.last_error}")
-        if last_process_error:
-            parts.append(f"analysis error: {last_process_error}")
-        elif last_result is not None and last_result.status_text:
-            parts.append(last_result.status_text)
+        if worker_snapshot.process_error:
+            parts.append(f"analysis error: {worker_snapshot.process_error}")
+        elif worker_snapshot.result is not None and worker_snapshot.result.status_text:
+            parts.append(worker_snapshot.result.status_text)
         status.setText(" | ".join(parts))
 
     def clear_history() -> None:
-        nonlocal last_result, last_process_error
-        history.clear()
-        last_result = None
-        last_process_error = None
+        nonlocal rendered_result
+        rendered_result = None
+        analysis_worker.clear_history()
         refresh()
 
     def stop_source() -> None:
-        nonlocal source_started
-        if source_started:
-            config.source.stop()
-            source_started = False
+        analysis_worker.stop()
 
     clear_button.clicked.connect(clear_history)
 
     timer = QtCore.QTimer(window)
-    interval_ms = max(1, round(1000.0 / config.plot_rate_hz))
+    effective_plot_rate_hz = min(config.plot_rate_hz, MAX_GUI_PLOT_RATE_HZ)
+    interval_ms = max(1, round(1000.0 / effective_plot_rate_hz))
     timer.timeout.connect(refresh)
 
     qt_app.aboutToQuit.connect(stop_source)
 
-    config.source.start()
-    source_started = True
+    analysis_worker.start()
     timer.start(interval_ms)
     refresh()
     window.show()
@@ -945,6 +1132,7 @@ def _build_parameter_widget(
     values: dict[str, ParamValue],
     *,
     QtWidgets: Any,
+    on_change: Callable[[str, ParamValue], None] | None = None,
 ) -> Any:
     if parameter.kind == "int":
         widget = QtWidgets.QSpinBox()
@@ -955,7 +1143,12 @@ def _build_parameter_widget(
         widget.setSingleStep(1 if parameter.step is None else int(parameter.step))
         widget.setValue(int(parameter.default))
         widget.valueChanged.connect(
-            lambda value, name=parameter.name: values.__setitem__(name, int(value))
+            lambda value, name=parameter.name: _set_parameter_value(
+                values,
+                on_change,
+                name,
+                int(value),
+            )
         )
         return widget
 
@@ -969,7 +1162,12 @@ def _build_parameter_widget(
         widget.setSingleStep(0.1 if parameter.step is None else float(parameter.step))
         widget.setValue(float(parameter.default))
         widget.valueChanged.connect(
-            lambda value, name=parameter.name: values.__setitem__(name, float(value))
+            lambda value, name=parameter.name: _set_parameter_value(
+                values,
+                on_change,
+                name,
+                float(value),
+            )
         )
         return widget
 
@@ -977,7 +1175,12 @@ def _build_parameter_widget(
         widget = QtWidgets.QCheckBox()
         widget.setChecked(bool(parameter.default))
         widget.toggled.connect(
-            lambda checked, name=parameter.name: values.__setitem__(name, bool(checked))
+            lambda checked, name=parameter.name: _set_parameter_value(
+                values,
+                on_change,
+                name,
+                bool(checked),
+            )
         )
         return widget
 
@@ -987,12 +1190,25 @@ def _build_parameter_widget(
     current_index = widget.findData(parameter.default)
     widget.setCurrentIndex(max(0, current_index))
     widget.currentIndexChanged.connect(
-        lambda _index, name=parameter.name, combo=widget: values.__setitem__(
+        lambda _index, name=parameter.name, combo=widget: _set_parameter_value(
+            values,
+            on_change,
             name,
             cast(str, combo.currentData()),
         )
     )
     return widget
+
+
+def _set_parameter_value(
+    values: dict[str, ParamValue],
+    on_change: Callable[[str, ParamValue], None] | None,
+    name: str,
+    value: ParamValue,
+) -> None:
+    values[name] = value
+    if on_change is not None:
+        on_change(name, value)
 
 
 __all__ = [

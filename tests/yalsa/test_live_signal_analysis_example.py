@@ -250,3 +250,57 @@ def test_main_runs_vesc_connection_cli_for_vesc_source(
     )
     assert calls["vesc_target"] == fake_target
     assert calls["app"] is fake_app
+
+
+def test_main_uses_process_argv_when_not_supplied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+    fake_target = VescTarget(VescConnection.serial("/dev/ttyACM0"))
+    fake_app = object()
+
+    def fake_run_vesc_connection_cli(argv: tuple[str, ...]) -> VescTarget:
+        calls["vesc_argv"] = argv
+        return fake_target
+
+    def fake_make_source(
+        config: LiveSignalAnalysisConfig,
+        *,
+        vesc_target: VescTarget | None = None,
+    ) -> tuple[object, str]:
+        calls["config"] = config
+        calls["vesc_target"] = vesc_target
+        return object(), "source label"
+
+    def fake_build_analysis(**kwargs: object) -> object:
+        calls["build_analysis_kwargs"] = kwargs
+        return fake_app
+
+    def fake_run_live_analysis(app: object) -> None:
+        calls["app"] = app
+
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "run_vesc_connection_cli",
+        fake_run_vesc_connection_cli,
+    )
+    monkeypatch.setattr(live_signal_analysis, "make_source", fake_make_source)
+    monkeypatch.setattr(live_signal_analysis, "build_analysis", fake_build_analysis)
+    monkeypatch.setattr(live_signal_analysis, "run_live_analysis", fake_run_live_analysis)
+    monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "vesc")
+    monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "acc_z")
+    monkeypatch.setattr(live_signal_analysis, "RUN_TIMEOUT", 0.25)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "live_signal_analysis.py",
+            "--serial",
+            "/dev/ttyACM0",
+        ],
+    )
+
+    live_signal_analysis.main()
+
+    assert calls["vesc_argv"] == ("--serial", "/dev/ttyACM0", "--timeout", "0.25")
+    assert calls["vesc_target"] == fake_target
+    assert calls["app"] is fake_app

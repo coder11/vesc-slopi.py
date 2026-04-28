@@ -316,3 +316,39 @@ Interpretation:
 - `srcdbg: wr`
 
 against the earlier `374.6 Hz` / `2.666 ms` live-analysis result.
+
+## GUI Decoupling Fix
+
+The live GUI runtime has now been changed so Qt/PyQtGraph no longer owns the
+source drain and DSP cadence.
+
+`src/yalsa/app.py` now runs a `_LiveAnalysisWorker` background thread that:
+
+- drains the source as samples arrive
+- updates `SignalBatchHistory`
+- runs the configured analysis callback, including filter and FFT/PSD work
+- publishes the latest full-resolution `AnalysisResult` to the GUI
+
+The Qt timer now only:
+
+- reads the latest already-processed result
+- decimates series for display according to each `PlotSpec.max_points`
+- updates PyQtGraph curves at the capped plot cadence
+- updates the status label
+
+The GUI plot cadence is also capped at `60 Hz` even if a higher
+`plot_rate_hz` is configured. The worker status now exposes a separate
+`processing` rate and last `proc` duration in the live status label, so future
+hardware runs can distinguish:
+
+- source acquisition rate
+- retained-history sample rate
+- analysis processing rate
+- GUI plot update rate
+
+The next hardware validation is to rerun:
+
+- `uv run examples/yalsa/live_signal_analysis.py --serial /dev/ttyACM0`
+
+and compare the live status values against the known headless-good values of
+roughly `1.3-1.4 kHz`.
