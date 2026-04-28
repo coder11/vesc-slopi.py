@@ -1,20 +1,103 @@
 import time
+from collections.abc import Callable, Mapping
 
 import numpy as np
 import pytest
 
+import yalsa.app as yalsa_app
+from vesc_py.live_signal import DeterministicSignalSource
 from yalsa import (
+    AnalysisResult,
     ChoiceOption,
+    LiveAnalysisApp,
+    PlotSpec,
+    PlotTrace,
     ScalarSignalSourceAdapter,
     SignalBatch,
     SignalBatchHistory,
+    SignalBatchSourceSnapshot,
     choice_parameter,
     default_parameter_values,
     float_parameter,
     int_parameter,
     xy_series,
 )
-from vesc_py.live_signal import DeterministicSignalSource
+
+
+def _wait_until(predicate: Callable[[], bool], timeout_s: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.005)
+    raise AssertionError("condition was not reached before timeout")
+
+
+class _FiniteBatchSource:
+    def __init__(self, batches: list[SignalBatch]) -> None:
+        self._batches = batches
+        self._index = 0
+        self._samples = 0
+        self._latest_sample_s: float | None = None
+        self._latest_value: float | None = None
+        self.started = False
+        self.stopped = False
+
+    @property
+    def channels(self) -> dict[str, str]:
+        return {"acc_z": "g"}
+
+    def start(self) -> None:
+        self.started = True
+
+    def stop(self, timeout: float = 1.0) -> None:
+        self.stopped = True
+
+    def drain(self) -> tuple[SignalBatch, int]:
+        if self._index >= len(self._batches):
+            return yalsa_app.empty_signal_batch(self.channels), 0
+        batch = self._batches[self._index]
+        self._index += 1
+        self._samples += batch.sample_count
+        if batch.sample_count > 0:
+            self._latest_sample_s = float(batch.timestamps_s[-1])
+            self._latest_value = float(batch.channel("acc_z")[-1])
+        return batch, 0
+
+    def snapshot(self) -> SignalBatchSourceSnapshot:
+        latest_values = (
+            {} if self._latest_value is None else {"acc_z": self._latest_value}
+        )
+        return SignalBatchSourceSnapshot(
+            samples=self._samples,
+            dropped=0,
+            errors=0,
+            average_rate_hz=float(self._samples),
+            latest_sample_s=self._latest_sample_s,
+            latest_values=latest_values,
+            last_error=None,
+            done=self.stopped,
+        )
+
+
+def _single_plot_app(
+    source: _FiniteBatchSource,
+    process: yalsa_app.ProcessCallback,
+) -> LiveAnalysisApp:
+    return LiveAnalysisApp(
+        title="test",
+        source=source,
+        plots=(
+            PlotSpec(
+                title="time",
+                traces=(PlotTrace(series="raw", label="Raw"),),
+                x_label="time",
+                y_label="acc_z",
+            ),
+        ),
+        process=process,
+        history=8,
+    )
 
 
 def test_signal_batch_rejects_mismatched_channel_lengths() -> None:
@@ -121,3 +204,258 @@ def test_scalar_signal_source_adapter_exposes_batch_protocol() -> None:
     assert batch.channel("acc_z").size == batch.timestamps_s.size
     assert snapshot.samples >= 1
     assert snapshot.done
+
+
+def test_live_analysis_status_lines_include_signal_and_source_data() -> None:
+    worker_snapshot = yalsa_app._AnalysisWorkerSnapshot(
+        result=AnalysisResult(
+            series={"raw": xy_series([0.0], [1.0])},
+            status_text="mode: PSD | raw RMS: 0.5 g | filtered RMS: 0.4 g",
+        ),
+        process_error=None,
+        source_snapshot=SignalBatchSourceSnapshot(
+            samples=10,
+            dropped=2,
+            errors=1,
+            average_rate_hz=123.0,
+            latest_sample_s=0.1,
+            latest_values={"acc_z": 0.25},
+            last_error=None,
+            done=False,
+        ),
+        history_rate_hz=120.0,
+    )
+
+    assert yalsa_app._signal_status_lines(worker_snapshot, {"acc_z": "g"}) == [
+        "current acc_z: 0.25 g",
+        "mode: PSD",
+        "raw RMS: 0.5 g",
+        "filtered RMS: 0.4 g",
+        "source: 123.0 Hz",
+        "history: 120.0 Hz",
+        "samples: 10",
+        "dropped: 2",
+        "errors: 1",
+    ]
+
+
+def test_qt_theme_stylesheet_forces_light_widget_palette() -> None:
+    stylesheet = yalsa_app._qt_theme_stylesheet(yalsa_app.PLOT_THEMES["light"])
+
+    assert "background-color: #f6f7f9" in stylesheet
+    assert "color: #202124" in stylesheet
+    assert "QPushButton, QSpinBox, QDoubleSpinBox, QComboBox" in stylesheet
+    assert "border: 1px solid #c7cdd4" in stylesheet
+
+
+def test_live_analysis_worker_processes_source_batches_off_gui_thread() -> None:
+    source = _FiniteBatchSource(
+        [
+            SignalBatch(
+                timestamps_s=np.array([0.0, 0.001], dtype=np.float64),
+                values={"acc_z": np.array([1.0, 2.0], dtype=np.float64)},
+                units={"acc_z": "g"},
+            )
+        ]
+    )
+    sample_counts: list[int] = []
+
+    def process(
+        data: yalsa_app.AnalysisInput,
+        params: Mapping[str, yalsa_app.ParamValue],
+    ) -> AnalysisResult:
+        del params
+        sample_counts.append(data.batch.sample_count)
+        return AnalysisResult(
+            series={"raw": xy_series(data.timestamps_s, data.channel("acc_z"))},
+            status_text=f"samples={data.batch.sample_count}",
+        )
+
+    worker = yalsa_app._LiveAnalysisWorker(_single_plot_app(source, process), {})
+    worker.start()
+    try:
+        _wait_until(lambda: worker.snapshot().result is not None)
+    finally:
+        worker.stop()
+
+    snapshot = worker.snapshot()
+    assert source.started
+    assert source.stopped
+    assert sample_counts[-1] == 2
+    assert snapshot.result is not None
+    assert snapshot.result.status_text == "samples=2"
+
+
+def test_live_analysis_worker_reprocesses_when_parameter_changes() -> None:
+    source = _FiniteBatchSource(
+        [
+            SignalBatch(
+                timestamps_s=np.array([0.0, 0.001], dtype=np.float64),
+                values={"acc_z": np.array([1.0, 2.0], dtype=np.float64)},
+                units={"acc_z": "g"},
+            )
+        ]
+    )
+    scales: list[float] = []
+
+    def process(
+        data: yalsa_app.AnalysisInput,
+        params: Mapping[str, yalsa_app.ParamValue],
+    ) -> AnalysisResult:
+        scale = float(params["scale"])
+        scales.append(scale)
+        return AnalysisResult(
+            series={"raw": xy_series(data.timestamps_s, data.channel("acc_z") * scale)},
+            status_text=f"scale={scale:g}",
+        )
+
+    app = _single_plot_app(source, process)
+    app = LiveAnalysisApp(
+        title=app.title,
+        source=app.source,
+        plots=app.plots,
+        process=app.process,
+        parameters=(float_parameter("scale", default=1.0),),
+        history=app.history,
+    )
+    worker = yalsa_app._LiveAnalysisWorker(
+        app,
+        default_parameter_values(app.parameters),
+    )
+    worker.start()
+    try:
+        _wait_until(lambda: worker.snapshot().result is not None)
+        worker.set_parameter("scale", 3.0)
+        _wait_until(
+            lambda: (
+                worker.snapshot().result is not None
+                and worker.snapshot().result.status_text == "scale=3"
+            )
+        )
+    finally:
+        worker.stop()
+
+    assert 1.0 in scales
+    assert scales[-1] == 3.0
+
+
+def test_live_analysis_ui_config_excludes_script_runtime_objects() -> None:
+    source = _FiniteBatchSource([])
+
+    def process(
+        data: yalsa_app.AnalysisInput,
+        params: Mapping[str, yalsa_app.ParamValue],
+    ) -> AnalysisResult:
+        del params
+        return AnalysisResult(
+            series={"raw": xy_series(data.timestamps_s, data.channel("acc_z"))},
+        )
+
+    ui_config = yalsa_app.live_analysis_ui_config(_single_plot_app(source, process))
+
+    assert ui_config.title == "test"
+    assert ui_config.channels == {"acc_z": "g"}
+    assert ui_config.plots[0].title == "time"
+    assert not hasattr(ui_config, "source")
+    assert not hasattr(ui_config, "process")
+
+
+def test_pickle_shared_memory_slot_keeps_latest_payload() -> None:
+    slot = yalsa_app._PickleSharedMemorySlot.create(4096)
+    attached: yalsa_app._PickleSharedMemorySlot | None = None
+    try:
+        first_version = slot.write({"value": 1})
+        second_version = slot.write({"value": 2})
+        attached = yalsa_app._PickleSharedMemorySlot.attach(slot.spec)
+
+        payload, version = attached.read_with_version()
+
+        assert first_version == 1
+        assert second_version == 2
+        assert payload == {"value": 2}
+        assert version == second_version
+    finally:
+        if attached is not None:
+            attached.close()
+        slot.close()
+        slot.unlink()
+
+
+def test_analysis_worker_process_publishes_results_via_shared_memory() -> None:
+    source = _FiniteBatchSource(
+        [
+            SignalBatch(
+                timestamps_s=np.array([0.0, 0.001], dtype=np.float64),
+                values={"acc_z": np.array([1.0, 2.0], dtype=np.float64)},
+                units={"acc_z": "g"},
+            )
+        ]
+    )
+
+    def process(
+        data: yalsa_app.AnalysisInput,
+        params: Mapping[str, yalsa_app.ParamValue],
+    ) -> AnalysisResult:
+        scale = float(params["scale"])
+        return AnalysisResult(
+            series={"raw": xy_series(data.timestamps_s, data.channel("acc_z") * scale)},
+            status_text=f"scale={scale:g}",
+        )
+
+    base_app = _single_plot_app(source, process)
+    app = LiveAnalysisApp(
+        title=base_app.title,
+        source=base_app.source,
+        plots=base_app.plots,
+        process=base_app.process,
+        parameters=(float_parameter("scale", default=2.0),),
+        history=base_app.history,
+        plot_rate_hz=30.0,
+    )
+    memory = yalsa_app._SharedAnalysisMemory.create(
+        yalsa_app.live_analysis_ui_config(app)
+    )
+    context = yalsa_app._multiprocessing_context()
+    worker = context.Process(
+        target=yalsa_app._run_analysis_worker_process,
+        args=(app, memory.spec),
+    )
+    worker.start()
+
+    def latest_status_text() -> str | None:
+        snapshot, _version = yalsa_app._read_analysis_snapshot(memory.state)
+        return None if snapshot.result is None else snapshot.result.status_text
+
+    try:
+        _wait_until(lambda: latest_status_text() == "scale=2")
+        control = yalsa_app._read_live_analysis_control(memory.control)
+        memory.control.write(
+            yalsa_app._LiveAnalysisControl(
+                parameter_values={"scale": 5.0},
+                parameter_revision=control.parameter_revision + 1,
+                clear_revision=control.clear_revision,
+                stop_requested=control.stop_requested,
+                shutdown_requested=control.shutdown_requested,
+            )
+        )
+
+        _wait_until(lambda: latest_status_text() == "scale=5")
+    finally:
+        control = yalsa_app._read_live_analysis_control(memory.control)
+        memory.control.write(
+            yalsa_app._LiveAnalysisControl(
+                parameter_values=control.parameter_values,
+                parameter_revision=control.parameter_revision,
+                clear_revision=control.clear_revision,
+                stop_requested=True,
+                shutdown_requested=True,
+            )
+        )
+        worker.join(timeout=2.0)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=2.0)
+        memory.close()
+        memory.unlink()
+
+    assert worker.exitcode == 0

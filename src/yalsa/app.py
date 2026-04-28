@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import ctypes
+import multiprocessing as mp
 import os
+import pickle
+import struct
 import sys
+import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import cycle
+from multiprocessing import shared_memory as mp_shared_memory
+from multiprocessing.context import BaseContext
 from typing import Any, Literal, Protocol, TypeAlias, cast
 
 import numpy as np
@@ -20,6 +27,16 @@ ParamValue: TypeAlias = int | float | bool | str
 PlotColor: TypeAlias = str | tuple[int, int, int]
 
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+NSEC_PER_SEC = 1_000_000_000
+_ANALYSIS_IDLE_SLEEP_S = 0.001
+_WORKER_STATUS_INTERVAL_NS = 50_000_000
+_SHARED_CONFIG_BYTES = 1 * 1024 * 1024
+_SHARED_CONTROL_BYTES = 1 * 1024 * 1024
+_SHARED_STATE_BYTES = 32 * 1024 * 1024
+_SUPERVISOR_POLL_S = 0.2
+_PROCESS_STOP_TIMEOUT_S = 2.0
+_SHARED_SLOT_MAGIC = b"YALSA001"
+_SHARED_SLOT_HEADER = struct.Struct("<8sQQQQ")
 
 
 def _empty_array() -> FloatArray:
@@ -200,7 +217,9 @@ class SignalBatchHistory:
         if sample_count >= self._capacity:
             self._timestamps[:] = timestamps[-self._capacity :]
             for channel_name in self._channel_names:
-                channel_values = batch.values[channel_name].astype(np.float64, copy=False)
+                channel_values = batch.values[channel_name].astype(
+                    np.float64, copy=False
+                )
                 self._values[channel_name][:] = channel_values[-self._capacity :]
             self._count = self._capacity
             self._write_index = 0
@@ -319,7 +338,11 @@ class ParameterSpec:
         elif self.kind == "bool":
             if not isinstance(self.default, bool):
                 raise TypeError("bool parameter default must be a bool")
-            if self.minimum is not None or self.maximum is not None or self.step is not None:
+            if (
+                self.minimum is not None
+                or self.maximum is not None
+                or self.step is not None
+            ):
                 raise ValueError("bool parameters do not support min/max/step")
             if self.decimals is not None:
                 raise ValueError("bool parameters do not support decimals")
@@ -331,7 +354,11 @@ class ParameterSpec:
             values = {choice.value for choice in self.choices}
             if self.default not in values:
                 raise ValueError("choice parameter default must match one option")
-            if self.minimum is not None or self.maximum is not None or self.step is not None:
+            if (
+                self.minimum is not None
+                or self.maximum is not None
+                or self.step is not None
+            ):
                 raise ValueError("choice parameters do not support min/max/step")
             if self.decimals is not None:
                 raise ValueError("choice parameters do not support decimals")
@@ -509,7 +536,9 @@ class AnalysisResult:
     status_text: str | None = None
 
 
-ProcessCallback: TypeAlias = Callable[[AnalysisInput, Mapping[str, ParamValue]], AnalysisResult]
+ProcessCallback: TypeAlias = Callable[
+    [AnalysisInput, Mapping[str, ParamValue]], AnalysisResult
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,7 +553,7 @@ class LiveAnalysisApp:
     history: int = 20_000
     plot_rate_hz: float = 30.0
     source_label: str | None = None
-    theme: Literal["light", "dark"] = "dark"
+    theme: Literal["light", "dark"] = "light"
     antialias: bool = False
 
     def __post_init__(self) -> None:
@@ -540,6 +569,46 @@ class LiveAnalysisApp:
 
 
 @dataclass(frozen=True, slots=True)
+class LiveAnalysisUiConfig:
+    """Qt-free declaration consumed by the GUI process."""
+
+    title: str
+    channels: Mapping[str, str]
+    plots: tuple[PlotSpec, ...]
+    parameters: tuple[ParameterSpec, ...] = ()
+    plot_rate_hz: float = 30.0
+    source_label: str | None = None
+    theme: Literal["light", "dark"] = "light"
+    antialias: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.title:
+            raise ValueError("title must not be empty")
+        if not self.channels:
+            raise ValueError("channels must not be empty")
+        if not self.plots:
+            raise ValueError("at least one plot is required")
+        if self.plot_rate_hz <= 0.0:
+            raise ValueError("plot_rate_hz must be greater than 0")
+        default_parameter_values(self.parameters)
+        object.__setattr__(self, "channels", dict(self.channels))
+
+
+def live_analysis_ui_config(config: LiveAnalysisApp) -> LiveAnalysisUiConfig:
+    """Extract the GUI-only declaration from a full analysis app."""
+    return LiveAnalysisUiConfig(
+        title=config.title,
+        channels=config.source.channels,
+        plots=config.plots,
+        parameters=config.parameters,
+        plot_rate_hz=config.plot_rate_hz,
+        source_label=config.source_label,
+        theme=config.theme,
+        antialias=config.antialias,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class PlotTheme:
     """Simple color bundle for the PyQtGraph UI."""
 
@@ -548,6 +617,10 @@ class PlotTheme:
     window_background: str
     text_color: str
     muted_color: str
+    control_background: str
+    control_border: str
+    control_hover: str
+    control_pressed: str
     grid_alpha: float
     line_colors: tuple[tuple[int, int, int], ...]
 
@@ -559,6 +632,10 @@ PLOT_THEMES = {
         window_background="#f6f7f9",
         text_color="#202124",
         muted_color="#4f5b66",
+        control_background="#ffffff",
+        control_border="#c7cdd4",
+        control_hover="#eef2f6",
+        control_pressed="#e2e8ef",
         grid_alpha=0.22,
         line_colors=(
             (196, 57, 54),
@@ -575,6 +652,10 @@ PLOT_THEMES = {
         window_background="#000000",
         text_color="#d0d0d0",
         muted_color="#999999",
+        control_background="#151515",
+        control_border="#3a3a3a",
+        control_hover="#202020",
+        control_pressed="#2a2a2a",
         grid_alpha=0.3,
         line_colors=(
             (230, 88, 85),
@@ -586,6 +667,377 @@ PLOT_THEMES = {
         ),
     ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class _AnalysisWorkerSnapshot:
+    result: AnalysisResult | None
+    process_error: str | None
+    source_snapshot: SignalBatchSourceSnapshot
+    history_rate_hz: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveAnalysisControl:
+    parameter_values: Mapping[str, ParamValue]
+    parameter_revision: int = 0
+    clear_revision: int = 0
+    stop_requested: bool = False
+    shutdown_requested: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameter_values", dict(self.parameter_values))
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedMemorySlotSpec:
+    name: str
+    size: int
+
+
+@dataclass(frozen=True, slots=True)
+class _SharedAnalysisMemorySpec:
+    config: _SharedMemorySlotSpec
+    state: _SharedMemorySlotSpec
+    control: _SharedMemorySlotSpec
+
+
+class _PickleSharedMemorySlot:
+    """Double-buffered pickle payload stored in multiprocessing shared memory."""
+
+    def __init__(self, shared_memory: mp_shared_memory.SharedMemory) -> None:
+        self._shared_memory = shared_memory
+        self._payload_capacity = (shared_memory.size - _SHARED_SLOT_HEADER.size) // 2
+        if self._payload_capacity <= 0:
+            raise ValueError("shared-memory slot is too small")
+
+    @classmethod
+    def create(cls, size: int) -> "_PickleSharedMemorySlot":
+        slot = cls(mp_shared_memory.SharedMemory(create=True, size=size))
+        slot._write_header(version=0, active_slot=0, length_0=0, length_1=0)
+        return slot
+
+    @classmethod
+    def attach(cls, spec: _SharedMemorySlotSpec) -> "_PickleSharedMemorySlot":
+        return cls(mp_shared_memory.SharedMemory(name=spec.name))
+
+    @property
+    def spec(self) -> _SharedMemorySlotSpec:
+        return _SharedMemorySlotSpec(
+            name=self._shared_memory.name,
+            size=self._shared_memory.size,
+        )
+
+    def write(self, value: object) -> int:
+        payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        if len(payload) > self._payload_capacity:
+            raise ValueError(
+                "shared-memory payload is too large "
+                f"({len(payload)} bytes > {self._payload_capacity} bytes)"
+            )
+
+        _magic, version, active_slot, length_0, length_1 = self._read_header()
+        next_slot = 1 - int(active_slot)
+        offset = self._payload_offset(next_slot)
+        buffer = cast(Any, self._shared_memory.buf)
+        buffer[offset : offset + len(payload)] = payload
+        if next_slot == 0:
+            length_0 = len(payload)
+        else:
+            length_1 = len(payload)
+        next_version = int(version) + 1
+        self._write_header(
+            version=next_version,
+            active_slot=next_slot,
+            length_0=int(length_0),
+            length_1=int(length_1),
+        )
+        return next_version
+
+    def read(self) -> object:
+        value, _version = self.read_with_version()
+        return value
+
+    def read_with_version(self) -> tuple[object, int]:
+        for _attempt in range(5):
+            header = self._read_header()
+            _magic, version, active_slot, length_0, length_1 = header
+            if active_slot not in (0, 1):
+                time.sleep(0.0)
+                continue
+            length = int(length_0 if active_slot == 0 else length_1)
+            if length < 0 or length > self._payload_capacity:
+                time.sleep(0.0)
+                continue
+            offset = self._payload_offset(int(active_slot))
+            buffer = cast(Any, self._shared_memory.buf)
+            payload = bytes(buffer[offset : offset + length])
+            if self._read_header() == header:
+                if not payload:
+                    raise RuntimeError("shared-memory slot has not been initialised")
+                return pickle.loads(payload), int(version)
+        raise RuntimeError("shared-memory slot changed while being read")
+
+    def close(self) -> None:
+        self._shared_memory.close()
+
+    def unlink(self) -> None:
+        try:
+            self._shared_memory.unlink()
+        except FileNotFoundError:
+            return
+
+    def _payload_offset(self, slot: int) -> int:
+        return _SHARED_SLOT_HEADER.size + slot * self._payload_capacity
+
+    def _read_header(self) -> tuple[bytes, int, int, int, int]:
+        header = _SHARED_SLOT_HEADER.unpack_from(cast(Any, self._shared_memory.buf), 0)
+        magic, version, active_slot, length_0, length_1 = header
+        if magic != _SHARED_SLOT_MAGIC:
+            raise RuntimeError("invalid YALSA shared-memory slot")
+        return (
+            cast(bytes, magic),
+            int(version),
+            int(active_slot),
+            int(length_0),
+            int(length_1),
+        )
+
+    def _write_header(
+        self,
+        *,
+        version: int,
+        active_slot: int,
+        length_0: int,
+        length_1: int,
+    ) -> None:
+        _SHARED_SLOT_HEADER.pack_into(
+            cast(Any, self._shared_memory.buf),
+            0,
+            _SHARED_SLOT_MAGIC,
+            version,
+            active_slot,
+            length_0,
+            length_1,
+        )
+
+
+class _SharedAnalysisMemory:
+    """Shared-memory channels used by the YALSA supervisor and child processes."""
+
+    def __init__(
+        self,
+        *,
+        config: _PickleSharedMemorySlot,
+        state: _PickleSharedMemorySlot,
+        control: _PickleSharedMemorySlot,
+    ) -> None:
+        self.config = config
+        self.state = state
+        self.control = control
+
+    @classmethod
+    def create(cls, ui_config: LiveAnalysisUiConfig) -> "_SharedAnalysisMemory":
+        memory = cls(
+            config=_PickleSharedMemorySlot.create(_SHARED_CONFIG_BYTES),
+            state=_PickleSharedMemorySlot.create(_SHARED_STATE_BYTES),
+            control=_PickleSharedMemorySlot.create(_SHARED_CONTROL_BYTES),
+        )
+        memory.config.write(ui_config)
+        memory.control.write(
+            _LiveAnalysisControl(
+                parameter_values=default_parameter_values(ui_config.parameters),
+            )
+        )
+        memory.state.write(_initial_analysis_snapshot())
+        return memory
+
+    @classmethod
+    def attach(cls, spec: _SharedAnalysisMemorySpec) -> "_SharedAnalysisMemory":
+        return cls(
+            config=_PickleSharedMemorySlot.attach(spec.config),
+            state=_PickleSharedMemorySlot.attach(spec.state),
+            control=_PickleSharedMemorySlot.attach(spec.control),
+        )
+
+    @property
+    def spec(self) -> _SharedAnalysisMemorySpec:
+        return _SharedAnalysisMemorySpec(
+            config=self.config.spec,
+            state=self.state.spec,
+            control=self.control.spec,
+        )
+
+    def close(self) -> None:
+        self.config.close()
+        self.state.close()
+        self.control.close()
+
+    def unlink(self) -> None:
+        self.config.unlink()
+        self.state.unlink()
+        self.control.unlink()
+
+
+def _initial_analysis_snapshot() -> _AnalysisWorkerSnapshot:
+    return _AnalysisWorkerSnapshot(
+        result=None,
+        process_error=None,
+        source_snapshot=SignalBatchSourceSnapshot(
+            samples=0,
+            dropped=0,
+            errors=0,
+            average_rate_hz=0.0,
+            latest_sample_s=None,
+            latest_values={},
+            last_error=None,
+            done=False,
+        ),
+        history_rate_hz=None,
+    )
+
+
+class _LiveAnalysisWorker:
+    """Drain, retain, and process source samples outside the Qt GUI thread."""
+
+    def __init__(
+        self,
+        config: LiveAnalysisApp,
+        parameter_values: Mapping[str, ParamValue],
+    ) -> None:
+        self._config = config
+        self._history = SignalBatchHistory(config.history, config.source.channels)
+        self._parameter_values = dict(parameter_values)
+        self._parameter_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._clear_requested = threading.Event()
+        self._process_requested = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._source_started = False
+        self._last_result: AnalysisResult | None = None
+        self._last_process_error: str | None = None
+        self._source_snapshot = config.source.snapshot()
+        self._history_rate_hz: float | None = None
+        self._last_status_update_ns = 0
+
+    def start(self) -> None:
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._clear_requested.clear()
+            self._process_requested.clear()
+            with self._state_lock:
+                self._last_result = None
+                self._last_process_error = None
+                self._source_snapshot = self._config.source.snapshot()
+                self._history_rate_hz = None
+            self._config.source.start()
+            self._source_started = True
+            self._thread = threading.Thread(
+                target=self._run,
+                name="yalsa-analysis-worker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        with self._lifecycle_lock:
+            self._stop.set()
+            if self._source_started:
+                self._config.source.stop(timeout=timeout)
+                self._source_started = False
+            thread = self._thread
+
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=timeout)
+
+    def set_parameter(self, name: str, value: ParamValue) -> None:
+        with self._parameter_lock:
+            if name not in self._parameter_values:
+                raise KeyError(f"unknown parameter {name!r}")
+            self._parameter_values[name] = value
+        self._process_requested.set()
+
+    def clear_history(self) -> None:
+        self._clear_requested.set()
+        self._process_requested.set()
+        with self._state_lock:
+            self._last_result = None
+            self._last_process_error = None
+            self._history_rate_hz = None
+
+    def snapshot(self) -> _AnalysisWorkerSnapshot:
+        with self._state_lock:
+            return _AnalysisWorkerSnapshot(
+                result=self._last_result,
+                process_error=self._last_process_error,
+                source_snapshot=self._source_snapshot,
+                history_rate_hz=self._history_rate_hz,
+            )
+
+    def _parameter_snapshot(self) -> dict[str, ParamValue]:
+        with self._parameter_lock:
+            return dict(self._parameter_values)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if self._clear_requested.is_set():
+                    self._clear_requested.clear()
+                    self._history.clear()
+
+                batch, _dropped = self._config.source.drain()
+                has_new_samples = batch.sample_count > 0
+                if has_new_samples:
+                    self._history.append_batch(batch)
+
+                forced_process = self._process_requested.is_set()
+                if forced_process:
+                    self._process_requested.clear()
+
+                if has_new_samples or forced_process:
+                    self._process_latest()
+                else:
+                    self._update_source_status_if_due()
+                    self._stop.wait(_ANALYSIS_IDLE_SLEEP_S)
+        except Exception as exc:  # noqa: BLE001 - worker errors are surfaced in UI.
+            with self._state_lock:
+                self._last_process_error = f"analysis worker error: {exc}"
+
+    def _process_latest(self) -> None:
+        history_rate_hz = self._history.sample_hz()
+        source_snapshot = self._config.source.snapshot()
+        analysis_input = AnalysisInput(
+            batch=self._history.snapshot(),
+            sample_rate_hz=history_rate_hz,
+            snapshot=source_snapshot,
+        )
+        try:
+            result = self._config.process(analysis_input, self._parameter_snapshot())
+        except Exception as exc:  # noqa: BLE001 - analysis errors are surfaced in UI.
+            result = None
+            process_error: str | None = str(exc)
+        else:
+            process_error = None
+
+        with self._state_lock:
+            if process_error is None:
+                self._last_result = result
+            self._last_process_error = process_error
+            self._source_snapshot = source_snapshot
+            self._history_rate_hz = history_rate_hz
+
+    def _update_source_status_if_due(self) -> None:
+        now_ns = time.perf_counter_ns()
+        if now_ns - self._last_status_update_ns < _WORKER_STATUS_INTERVAL_NS:
+            return
+        self._last_status_update_ns = now_ns
+        with self._state_lock:
+            self._source_snapshot = self._config.source.snapshot()
+            self._history_rate_hz = self._history.sample_hz()
 
 
 def prefer_qt_xcb_platform() -> None:
@@ -660,8 +1112,210 @@ def _format_latest_values(
     return ", ".join(parts)
 
 
-def run_live_analysis(config: LiveAnalysisApp) -> None:
-    """Run the generic live-analysis GUI until the Qt app exits."""
+def _qt_theme_stylesheet(theme: PlotTheme) -> str:
+    return f"""
+QWidget {{
+    background-color: {theme.window_background};
+    color: {theme.text_color};
+}}
+QLabel, QCheckBox {{
+    color: {theme.text_color};
+}}
+QPushButton, QSpinBox, QDoubleSpinBox, QComboBox {{
+    background-color: {theme.control_background};
+    border: 1px solid {theme.control_border};
+    border-radius: 3px;
+    color: {theme.text_color};
+    padding: 3px 6px;
+}}
+QPushButton:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+    background-color: {theme.control_hover};
+}}
+QPushButton:pressed {{
+    background-color: {theme.control_pressed};
+}}
+QComboBox QAbstractItemView {{
+    background-color: {theme.control_background};
+    color: {theme.text_color};
+    selection-background-color: {theme.control_hover};
+}}
+"""
+
+
+def _format_latest_value_lines(
+    snapshot: SignalBatchSourceSnapshot,
+    channels: Mapping[str, str],
+) -> list[str]:
+    if not snapshot.latest_values:
+        return ["current: n/a"]
+    lines: list[str] = []
+    for channel_name, value in snapshot.latest_values.items():
+        unit = channels.get(channel_name, "")
+        suffix = f" {unit}" if unit else ""
+        lines.append(f"current {channel_name}: {value:.6g}{suffix}")
+    return lines
+
+
+def _split_status_lines(text: str | None) -> list[str]:
+    if text is None:
+        return []
+    return [part.strip() for part in text.split("|") if part.strip()]
+
+
+def _signal_status_lines(
+    worker_snapshot: _AnalysisWorkerSnapshot,
+    channels: Mapping[str, str],
+) -> list[str]:
+    snapshot = worker_snapshot.source_snapshot
+    lines = _format_latest_value_lines(snapshot, channels)
+    if snapshot.last_error:
+        lines.append(f"source error: {snapshot.last_error}")
+    if worker_snapshot.process_error:
+        lines.append(f"analysis error: {worker_snapshot.process_error}")
+    elif worker_snapshot.result is not None:
+        lines.extend(_split_status_lines(worker_snapshot.result.status_text))
+    snapshot = worker_snapshot.source_snapshot
+    lines.extend(
+        (
+            f"source: {_format_rate(snapshot.average_rate_hz)}",
+            f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
+            f"samples: {snapshot.samples}",
+            f"dropped: {snapshot.dropped}",
+            f"errors: {snapshot.errors}",
+        )
+    )
+    return lines
+
+
+def _read_live_analysis_control(slot: _PickleSharedMemorySlot) -> _LiveAnalysisControl:
+    value = slot.read()
+    if not isinstance(value, _LiveAnalysisControl):
+        raise RuntimeError("shared-memory control slot contains an unexpected payload")
+    return value
+
+
+def _read_live_analysis_ui_config(
+    slot: _PickleSharedMemorySlot,
+) -> LiveAnalysisUiConfig:
+    value = slot.read()
+    if not isinstance(value, LiveAnalysisUiConfig):
+        raise RuntimeError("shared-memory config slot contains an unexpected payload")
+    return value
+
+
+def _read_analysis_snapshot(
+    slot: _PickleSharedMemorySlot,
+) -> tuple[_AnalysisWorkerSnapshot, int]:
+    value, version = slot.read_with_version()
+    if not isinstance(value, _AnalysisWorkerSnapshot):
+        raise RuntimeError("shared-memory state slot contains an unexpected payload")
+    return value, version
+
+
+def _update_live_analysis_control(
+    slot: _PickleSharedMemorySlot,
+    update: Callable[[_LiveAnalysisControl], _LiveAnalysisControl],
+) -> None:
+    slot.write(update(_read_live_analysis_control(slot)))
+
+
+def _snapshot_without_result(
+    snapshot: _AnalysisWorkerSnapshot,
+    error: str,
+) -> _AnalysisWorkerSnapshot:
+    process_error = error
+    if snapshot.process_error:
+        process_error = f"{snapshot.process_error}; {error}"
+    return _AnalysisWorkerSnapshot(
+        result=None,
+        process_error=process_error,
+        source_snapshot=snapshot.source_snapshot,
+        history_rate_hz=snapshot.history_rate_hz,
+    )
+
+
+def _write_analysis_snapshot(
+    slot: _PickleSharedMemorySlot,
+    snapshot: _AnalysisWorkerSnapshot,
+) -> None:
+    try:
+        slot.write(snapshot)
+    except ValueError as exc:
+        slot.write(_snapshot_without_result(snapshot, str(exc)))
+
+
+def _analysis_process_error_snapshot(error: str) -> _AnalysisWorkerSnapshot:
+    snapshot = _initial_analysis_snapshot()
+    return _AnalysisWorkerSnapshot(
+        result=None,
+        process_error=error,
+        source_snapshot=snapshot.source_snapshot,
+        history_rate_hz=snapshot.history_rate_hz,
+    )
+
+
+def _run_analysis_worker_process(
+    config: LiveAnalysisApp,
+    memory_spec: _SharedAnalysisMemorySpec,
+) -> None:
+    """Run source acquisition and analysis in the script child process."""
+    memory = _SharedAnalysisMemory.attach(memory_spec)
+    worker: _LiveAnalysisWorker | None = None
+    try:
+        control = _read_live_analysis_control(memory.control)
+        worker = _LiveAnalysisWorker(config, control.parameter_values)
+        last_parameter_revision = control.parameter_revision
+        last_clear_revision = control.clear_revision
+        publish_interval_ns = max(1, round(NSEC_PER_SEC / config.plot_rate_hz))
+        next_publish_ns = time.perf_counter_ns()
+
+        worker.start()
+        while True:
+            control = _read_live_analysis_control(memory.control)
+            if control.stop_requested or control.shutdown_requested:
+                break
+
+            if control.parameter_revision != last_parameter_revision:
+                for name, value in control.parameter_values.items():
+                    worker.set_parameter(name, value)
+                last_parameter_revision = control.parameter_revision
+
+            if control.clear_revision != last_clear_revision:
+                worker.clear_history()
+                last_clear_revision = control.clear_revision
+
+            now_ns = time.perf_counter_ns()
+            if now_ns >= next_publish_ns:
+                _write_analysis_snapshot(memory.state, worker.snapshot())
+                next_publish_ns = now_ns + publish_interval_ns
+
+            sleep_ns = max(0, next_publish_ns - time.perf_counter_ns())
+            time.sleep(min(_ANALYSIS_IDLE_SLEEP_S, sleep_ns / NSEC_PER_SEC))
+    except Exception as exc:  # noqa: BLE001 - supervisor restarts this process.
+        try:
+            memory.state.write(_analysis_process_error_snapshot(str(exc)))
+        finally:
+            raise
+    finally:
+        if worker is not None:
+            worker.stop()
+        memory.close()
+
+
+def _run_live_analysis_gui_process(memory_spec: _SharedAnalysisMemorySpec) -> None:
+    """Run the Qt/PyQtGraph child process."""
+    memory = _SharedAnalysisMemory.attach(memory_spec)
+    try:
+        _run_live_analysis_gui(_read_live_analysis_ui_config(memory.config), memory)
+    finally:
+        memory.close()
+
+
+def _run_live_analysis_gui(
+    config: LiveAnalysisUiConfig,
+    memory: _SharedAnalysisMemory,
+) -> None:
+    """Run the generic live-analysis GUI from shared-memory state."""
     selected_theme = PLOT_THEMES[config.theme]
     pg, QtCore, QtWidgets = import_pyqtgraph()
     require_qt_platform_runtime()
@@ -675,7 +1329,7 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
     window = QtWidgets.QWidget()
     window.setWindowTitle(config.title)
     window.resize(1440, 900)
-    window.setStyleSheet(f"background-color: {selected_theme.window_background};")
+    window.setStyleSheet(_qt_theme_stylesheet(selected_theme))
 
     qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
     qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
@@ -694,21 +1348,42 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
     controls.addWidget(source_text)
 
     channel_summary = ", ".join(
-        f"{name} ({unit})" if unit else name for name, unit in config.source.channels.items()
+        f"{name} ({unit})" if unit else name for name, unit in config.channels.items()
     )
     channel_text = QtWidgets.QLabel(channel_summary)
     channel_text.setStyleSheet(f"color: {selected_theme.muted_color};")
     controls.addWidget(channel_text)
 
     controls.addSpacing(12)
-    parameter_values = default_parameter_values(config.parameters)
+    try:
+        parameter_values = dict(
+            _read_live_analysis_control(memory.control).parameter_values
+        )
+    except RuntimeError:
+        parameter_values = default_parameter_values(config.parameters)
     parameter_widgets: dict[str, Any] = {}
+
+    def set_parameter(name: str, value: ParamValue) -> None:
+        def update(control: _LiveAnalysisControl) -> _LiveAnalysisControl:
+            values = dict(control.parameter_values)
+            values[name] = value
+            return _LiveAnalysisControl(
+                parameter_values=values,
+                parameter_revision=control.parameter_revision + 1,
+                clear_revision=control.clear_revision,
+                stop_requested=control.stop_requested,
+                shutdown_requested=control.shutdown_requested,
+            )
+
+        _update_live_analysis_control(memory.control, update)
+
     for parameter in config.parameters:
         controls.addWidget(QtWidgets.QLabel(parameter.label))
         widget = _build_parameter_widget(
             parameter,
             parameter_values,
             QtWidgets=QtWidgets,
+            on_change=set_parameter,
         )
         parameter_widgets[parameter.name] = widget
         controls.addWidget(widget)
@@ -717,11 +1392,11 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
     controls.addWidget(clear_button)
     controls.addStretch(1)
 
-    status = QtWidgets.QLabel("Waiting for signal data...")
-    status.setAlignment(qt_alignment.AlignLeft)
-    status.setWordWrap(True)
-    status.setStyleSheet(f"color: {selected_theme.muted_color};")
-    root.addWidget(status)
+    signal_status = QtWidgets.QLabel("Waiting for signal data...")
+    signal_status.setAlignment(qt_alignment.AlignLeft)
+    signal_status.setWordWrap(True)
+    signal_status.setStyleSheet(f"color: {selected_theme.muted_color};")
+    root.addWidget(signal_status)
 
     plot_grid = QtWidgets.QGridLayout()
     plot_grid.setContentsMargins(0, 0, 0, 0)
@@ -765,73 +1440,73 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
         plot_items.append(plot_item)
         plot_curves.append(curves)
 
-    history = SignalBatchHistory(config.history, config.source.channels)
-    last_result: AnalysisResult | None = None
-    last_process_error: str | None = None
-    source_started = False
+    rendered_state_version: int | None = None
 
     def refresh() -> None:
-        nonlocal last_result, last_process_error
-        batch, _dropped = config.source.drain()
-        history.append_batch(batch)
-        analysis_input = AnalysisInput(
-            batch=history.snapshot(),
-            sample_rate_hz=history.sample_hz(),
-            snapshot=config.source.snapshot(),
-        )
+        nonlocal rendered_state_version
+
         try:
-            result = config.process(analysis_input, parameter_values)
-        except Exception as exc:  # noqa: BLE001 - analysis errors are surfaced in UI.
-            last_process_error = str(exc)
-        else:
-            last_result = result
-            last_process_error = None
+            worker_snapshot, state_version = _read_analysis_snapshot(memory.state)
+        except RuntimeError as exc:
+            signal_status.setText(f"shared-memory error: {exc}")
+            return
 
-        for plot_spec, plot_item, curves in zip(
-            config.plots,
-            plot_items,
-            plot_curves,
-            strict=True,
-        ):
-            for trace in plot_spec.traces:
-                series = None if last_result is None else last_result.series.get(trace.series)
-                curve = curves[trace.series]
-                if series is None:
-                    curve.setData(_empty_array(), _empty_array())
-                    continue
-                decimated = _decimate_series(series, plot_spec.max_points)
-                curve.setData(decimated.x, decimated.y)
-            plot_item.autoRange()
+        if state_version != rendered_state_version:
+            rendered_state_version = state_version
+            for plot_spec, plot_item, curves in zip(
+                config.plots,
+                plot_items,
+                plot_curves,
+                strict=True,
+            ):
+                for trace in plot_spec.traces:
+                    series = (
+                        None
+                        if worker_snapshot.result is None
+                        else worker_snapshot.result.series.get(trace.series)
+                    )
+                    curve = curves[trace.series]
+                    if series is None:
+                        curve.setData(_empty_array(), _empty_array())
+                        continue
+                    decimated = _decimate_series(series, plot_spec.max_points)
+                    curve.setData(decimated.x, decimated.y)
+                plot_item.autoRange()
 
-        snapshot = analysis_input.snapshot
-        parts = [
-            f"source: {_format_rate(snapshot.average_rate_hz)}",
-            f"history: {_format_rate(analysis_input.sample_rate_hz)}",
-            f"samples: {snapshot.samples}",
-            f"dropped: {snapshot.dropped}",
-            f"errors: {snapshot.errors}",
-            f"latest: {_format_latest_values(snapshot, config.source.channels)}",
-        ]
-        if snapshot.last_error:
-            parts.append(f"source error: {snapshot.last_error}")
-        if last_process_error:
-            parts.append(f"analysis error: {last_process_error}")
-        elif last_result is not None and last_result.status_text:
-            parts.append(last_result.status_text)
-        status.setText(" | ".join(parts))
+        signal_status.setText(
+            "\n".join(_signal_status_lines(worker_snapshot, config.channels))
+        )
 
     def clear_history() -> None:
-        nonlocal last_result, last_process_error
-        history.clear()
-        last_result = None
-        last_process_error = None
+        nonlocal rendered_state_version
+        rendered_state_version = None
+
+        def update(control: _LiveAnalysisControl) -> _LiveAnalysisControl:
+            return _LiveAnalysisControl(
+                parameter_values=control.parameter_values,
+                parameter_revision=control.parameter_revision,
+                clear_revision=control.clear_revision + 1,
+                stop_requested=control.stop_requested,
+                shutdown_requested=control.shutdown_requested,
+            )
+
+        _update_live_analysis_control(memory.control, update)
         refresh()
 
-    def stop_source() -> None:
-        nonlocal source_started
-        if source_started:
-            config.source.stop()
-            source_started = False
+    def request_shutdown() -> None:
+        def update(control: _LiveAnalysisControl) -> _LiveAnalysisControl:
+            return _LiveAnalysisControl(
+                parameter_values=control.parameter_values,
+                parameter_revision=control.parameter_revision,
+                clear_revision=control.clear_revision,
+                stop_requested=True,
+                shutdown_requested=True,
+            )
+
+        try:
+            _update_live_analysis_control(memory.control, update)
+        except RuntimeError:
+            return
 
     clear_button.clicked.connect(clear_history)
 
@@ -839,10 +1514,8 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
     interval_ms = max(1, round(1000.0 / config.plot_rate_hz))
     timer.timeout.connect(refresh)
 
-    qt_app.aboutToQuit.connect(stop_source)
+    qt_app.aboutToQuit.connect(request_shutdown)
 
-    config.source.start()
-    source_started = True
     timer.start(interval_ms)
     refresh()
     window.show()
@@ -855,7 +1528,112 @@ def run_live_analysis(config: LiveAnalysisApp) -> None:
             qt_app.exec()
     finally:
         timer.stop()
-        stop_source()
+        request_shutdown()
+
+
+def _multiprocessing_context() -> BaseContext:
+    if "fork" not in mp.get_all_start_methods():
+        raise RuntimeError("YALSA live analysis multiprocessing requires fork support")
+    return mp.get_context("fork")
+
+
+def _start_analysis_worker_process(
+    context: BaseContext,
+    config: LiveAnalysisApp,
+    memory_spec: _SharedAnalysisMemorySpec,
+) -> mp.Process:
+    process = cast(
+        mp.Process,
+        cast(Any, context).Process(
+            target=_run_analysis_worker_process,
+            args=(config, memory_spec),
+            name="yalsa-script-process",
+        ),
+    )
+    process.start()
+    return process
+
+
+def _start_live_analysis_gui_process(
+    context: BaseContext,
+    memory_spec: _SharedAnalysisMemorySpec,
+) -> mp.Process:
+    process = cast(
+        mp.Process,
+        cast(Any, context).Process(
+            target=_run_live_analysis_gui_process,
+            args=(memory_spec,),
+            name="yalsa-gui-process",
+        ),
+    )
+    process.start()
+    return process
+
+
+def _request_shared_shutdown(memory: _SharedAnalysisMemory) -> None:
+    def update(control: _LiveAnalysisControl) -> _LiveAnalysisControl:
+        return _LiveAnalysisControl(
+            parameter_values=control.parameter_values,
+            parameter_revision=control.parameter_revision,
+            clear_revision=control.clear_revision,
+            stop_requested=True,
+            shutdown_requested=True,
+        )
+
+    try:
+        _update_live_analysis_control(memory.control, update)
+    except RuntimeError:
+        return
+
+
+def _stop_child_process(process: mp.Process) -> None:
+    if process.is_alive():
+        process.join(timeout=_PROCESS_STOP_TIMEOUT_S)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=_PROCESS_STOP_TIMEOUT_S)
+    if process.is_alive() and hasattr(process, "kill"):
+        process.kill()
+        process.join(timeout=_PROCESS_STOP_TIMEOUT_S)
+    process.join(timeout=0.0)
+
+
+def run_live_analysis(config: LiveAnalysisApp) -> None:
+    """Run YALSA as a supervised script process plus a Qt GUI process."""
+    context = _multiprocessing_context()
+    memory = _SharedAnalysisMemory.create(live_analysis_ui_config(config))
+    memory_spec = memory.spec
+    worker_process = _start_analysis_worker_process(context, config, memory_spec)
+    gui_process = _start_live_analysis_gui_process(context, memory_spec)
+    try:
+        while True:
+            time.sleep(_SUPERVISOR_POLL_S)
+            control = _read_live_analysis_control(memory.control)
+            if control.shutdown_requested or control.stop_requested:
+                break
+
+            if gui_process.exitcode is not None:
+                if gui_process.exitcode == 0:
+                    _request_shared_shutdown(memory)
+                    break
+                gui_process.join(timeout=0.0)
+                gui_process = _start_live_analysis_gui_process(context, memory_spec)
+
+            if worker_process.exitcode is not None:
+                worker_process.join(timeout=0.0)
+                worker_process = _start_analysis_worker_process(
+                    context,
+                    config,
+                    memory_spec,
+                )
+    except KeyboardInterrupt:
+        _request_shared_shutdown(memory)
+    finally:
+        _request_shared_shutdown(memory)
+        _stop_child_process(gui_process)
+        _stop_child_process(worker_process)
+        memory.close()
+        memory.unlink()
 
 
 def _build_parameter_widget(
@@ -863,54 +1641,87 @@ def _build_parameter_widget(
     values: dict[str, ParamValue],
     *,
     QtWidgets: Any,
+    on_change: Callable[[str, ParamValue], None] | None = None,
 ) -> Any:
     if parameter.kind == "int":
         widget = QtWidgets.QSpinBox()
+        value = values.get(parameter.name, parameter.default)
         widget.setRange(
             -2_147_483_648 if parameter.minimum is None else int(parameter.minimum),
             2_147_483_647 if parameter.maximum is None else int(parameter.maximum),
         )
         widget.setSingleStep(1 if parameter.step is None else int(parameter.step))
-        widget.setValue(int(parameter.default))
+        widget.setValue(int(value))
         widget.valueChanged.connect(
-            lambda value, name=parameter.name: values.__setitem__(name, int(value))
+            lambda value, name=parameter.name: _set_parameter_value(
+                values,
+                on_change,
+                name,
+                int(value),
+            )
         )
         return widget
 
     if parameter.kind == "float":
         widget = QtWidgets.QDoubleSpinBox()
+        value = values.get(parameter.name, parameter.default)
         widget.setRange(
             -1e12 if parameter.minimum is None else float(parameter.minimum),
             1e12 if parameter.maximum is None else float(parameter.maximum),
         )
         widget.setDecimals(parameter.decimals if parameter.decimals is not None else 3)
         widget.setSingleStep(0.1 if parameter.step is None else float(parameter.step))
-        widget.setValue(float(parameter.default))
+        widget.setValue(float(value))
         widget.valueChanged.connect(
-            lambda value, name=parameter.name: values.__setitem__(name, float(value))
+            lambda value, name=parameter.name: _set_parameter_value(
+                values,
+                on_change,
+                name,
+                float(value),
+            )
         )
         return widget
 
     if parameter.kind == "bool":
         widget = QtWidgets.QCheckBox()
-        widget.setChecked(bool(parameter.default))
+        value = values.get(parameter.name, parameter.default)
+        widget.setChecked(bool(value))
         widget.toggled.connect(
-            lambda checked, name=parameter.name: values.__setitem__(name, bool(checked))
+            lambda checked, name=parameter.name: _set_parameter_value(
+                values,
+                on_change,
+                name,
+                bool(checked),
+            )
         )
         return widget
 
     widget = QtWidgets.QComboBox()
     for choice in parameter.choices:
         widget.addItem(choice.label, choice.value)
-    current_index = widget.findData(parameter.default)
+    value = values.get(parameter.name, parameter.default)
+    current_index = widget.findData(value)
     widget.setCurrentIndex(max(0, current_index))
     widget.currentIndexChanged.connect(
-        lambda _index, name=parameter.name, combo=widget: values.__setitem__(
+        lambda _index, name=parameter.name, combo=widget: _set_parameter_value(
+            values,
+            on_change,
             name,
             cast(str, combo.currentData()),
         )
     )
     return widget
+
+
+def _set_parameter_value(
+    values: dict[str, ParamValue],
+    on_change: Callable[[str, ParamValue], None] | None,
+    name: str,
+    value: ParamValue,
+) -> None:
+    values[name] = value
+    if on_change is not None:
+        on_change(name, value)
 
 
 __all__ = [
@@ -919,6 +1730,7 @@ __all__ = [
     "ChoiceOption",
     "FloatArray",
     "LiveAnalysisApp",
+    "LiveAnalysisUiConfig",
     "ParamValue",
     "ParameterSpec",
     "PlotSpec",
@@ -937,6 +1749,7 @@ __all__ = [
     "float_parameter",
     "import_pyqtgraph",
     "int_parameter",
+    "live_analysis_ui_config",
     "prefer_qt_xcb_platform",
     "require_qt_platform_runtime",
     "run_live_analysis",

@@ -129,6 +129,7 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
         "filter_order",
         "spectrum_mode",
     ]
+    assert app.theme == "light"
     assert len(app.plots) == 2
 
 
