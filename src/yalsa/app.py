@@ -622,10 +622,13 @@ class PlotSpec:
     y_range: tuple[float, float] | None = None
     # If set, X limits are applied after any initial autoRange (e.g. fixed spectrum span).
     x_range: tuple[float, float] | None = None
+    widget: Literal["plot", "orientation_3d", "empty"] = "plot"
 
     def __post_init__(self) -> None:
         if not self.traces:
             raise ValueError("plots must contain at least one trace")
+        if self.widget not in ("plot", "orientation_3d", "empty"):
+            raise ValueError("widget must be 'plot', 'orientation_3d', or 'empty'")
         if self.tab is not None and not self.tab:
             raise ValueError("plot tab must not be empty")
         if self.section is not None and not self.section:
@@ -1331,6 +1334,19 @@ def _follow_latest_x_range(
     return x_min, x_max
 
 
+def _latest_series_y(
+    result: AnalysisResult | None,
+    series_name: str,
+) -> float | None:
+    if result is None:
+        return None
+    series = result.series.get(series_name)
+    if series is None or int(series.y.size) == 0:
+        return None
+    value = float(series.y[-1])
+    return value if np.isfinite(value) else None
+
+
 def _format_latest_values(
     stats: SignalBatchSourceStats,
     channels: Mapping[str, str],
@@ -1583,6 +1599,8 @@ def _run_live_analysis_gui(
     """Run the generic live-analysis GUI from shared-memory state."""
     selected_theme = PLOT_THEMES[config.theme]
     pg, QtCore, QtWidgets = import_pyqtgraph()
+    from pyqtgraph.Qt import QtGui
+
     require_qt_platform_runtime()
     pg.setConfigOptions(
         antialias=config.antialias,
@@ -1601,7 +1619,7 @@ def _run_live_analysis_gui(
     qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
     qt_mouse_button = getattr(QtCore.Qt, "MouseButton", QtCore.Qt)
 
-    class _PlotViewBox(pg.ViewBox):
+    class _PlotViewBox(pg.ViewBox):  # type: ignore[name-defined, misc]
         def __init__(
             self,
             *,
@@ -1659,6 +1677,128 @@ def _run_live_analysis_gui(
             self.scaleBy(scales, center_point)
             ev.accept()
             self.sigRangeChangedManually.emit(mask)
+
+    class _Orientation3DWidget(QtWidgets.QWidget):  # type: ignore[name-defined, misc]
+        def __init__(self, title_text: str) -> None:
+            super().__init__()
+            self._title = title_text
+            self._roll_deg = 0.0
+            self._pitch_deg = 0.0
+            self._yaw_deg = 0.0
+            self._has_orientation = False
+            self.setMinimumSize(0, 0)
+            self.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
+
+        def set_orientation(
+            self,
+            roll_deg: float | None,
+            pitch_deg: float | None,
+            yaw_deg: float | None,
+        ) -> None:
+            if roll_deg is None or pitch_deg is None or yaw_deg is None:
+                if self._has_orientation:
+                    self._has_orientation = False
+                    self.update()
+                return
+            self._roll_deg = roll_deg
+            self._pitch_deg = pitch_deg
+            self._yaw_deg = yaw_deg
+            self._has_orientation = True
+            self.update()
+
+        def paintEvent(self, _event: Any) -> None:
+            painter = QtGui.QPainter(self)
+            painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
+            painter.fillRect(self.rect(), QtGui.QColor(selected_theme.pg_background))
+            painter.setPen(QtGui.QColor(selected_theme.text_color))
+            painter.drawText(
+                self.rect().adjusted(0, 4, 0, 0),
+                qt_alignment.AlignHCenter | qt_alignment.AlignTop,
+                self._title,
+            )
+
+            if not self._has_orientation:
+                painter.setPen(QtGui.QColor(selected_theme.muted_color))
+                painter.drawText(
+                    self.rect(),
+                    qt_alignment.AlignCenter,
+                    "Waiting for RPY",
+                )
+                painter.end()
+                return
+
+            width = max(1, self.width())
+            height = max(1, self.height())
+            scale = min(width / 4.2, height / 3.0)
+            center_x = width * 0.5
+            center_y = height * 0.55
+
+            roll = np.deg2rad(self._roll_deg)
+            pitch = np.deg2rad(self._pitch_deg)
+            yaw = np.deg2rad(self._yaw_deg)
+            sr, cr = np.sin(roll), np.cos(roll)
+            sp, cp = np.sin(pitch), np.cos(pitch)
+            sy, cy = np.sin(yaw), np.cos(yaw)
+            rotation = np.array(
+                [
+                    [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+                    [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+                    [-sp, cp * sr, cp * cr],
+                ],
+                dtype=float,
+            )
+
+            lx, ly, lz = 2.5, 1.35, 0.32
+            vertices = np.array(
+                [
+                    [-lx / 2, -ly / 2, -lz / 2],
+                    [lx / 2, -ly / 2, -lz / 2],
+                    [lx / 2, ly / 2, -lz / 2],
+                    [-lx / 2, ly / 2, -lz / 2],
+                    [-lx / 2, -ly / 2, lz / 2],
+                    [lx / 2, -ly / 2, lz / 2],
+                    [lx / 2, ly / 2, lz / 2],
+                    [-lx / 2, ly / 2, lz / 2],
+                ],
+                dtype=float,
+            )
+            points = vertices @ rotation.T
+
+            def project(point: np.ndarray) -> Any:
+                screen_x = center_x + (point[0] - point[1] * 0.42) * scale
+                screen_y = center_y + (point[1] * 0.26 - point[2]) * scale
+                return QtCore.QPointF(float(screen_x), float(screen_y))
+
+            faces = [
+                ((0, 1, 2, 3), QtGui.QColor("#9a9a9a")),
+                ((0, 4, 5, 1), QtGui.QColor("#b3b3b3")),
+                ((1, 5, 6, 2), QtGui.QColor("#8a8a8a")),
+                ((2, 6, 7, 3), QtGui.QColor("#747474")),
+                ((3, 7, 4, 0), QtGui.QColor("#a8a8a8")),
+                ((4, 7, 6, 5), QtGui.QColor("#25206f")),
+            ]
+            faces.sort(key=lambda face: float(np.mean(points[list(face[0]), 1])))
+            painter.setPen(QtGui.QPen(QtGui.QColor("#1c1c1c"), 1))
+            for indexes, color in faces:
+                polygon = QtGui.QPolygonF([project(points[index]) for index in indexes])
+                painter.setBrush(QtGui.QBrush(color))
+                painter.drawPolygon(polygon)
+
+            feature_vertices = np.array(
+                [
+                    [0.45, -0.35, lz / 2 + 0.01],
+                    [1.0, -0.35, lz / 2 + 0.01],
+                    [1.0, 0.2, lz / 2 + 0.01],
+                    [0.45, 0.2, lz / 2 + 0.01],
+                ],
+                dtype=float,
+            )
+            feature_points = feature_vertices @ rotation.T
+            painter.setBrush(QtGui.QBrush(QtGui.QColor("#101010")))
+            painter.drawPolygon(
+                QtGui.QPolygonF([project(point) for point in feature_points])
+            )
+            painter.end()
 
     root = QtWidgets.QVBoxLayout(window)
     root.setContentsMargins(8, 8, 8, 8)
@@ -1895,6 +2035,22 @@ def _run_live_analysis_gui(
         row: int,
         column: int,
     ) -> None:
+        if plot_spec.widget == "empty":
+            widget = QtWidgets.QWidget()
+            widget.setMinimumSize(0, 0)
+            widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
+            layout.addWidget(widget, row, column)
+            plot_items[plot_index] = widget
+            plot_curves[plot_index] = {}
+            return
+
+        if plot_spec.widget == "orientation_3d":
+            widget = _Orientation3DWidget(plot_spec.title)
+            layout.addWidget(widget, row, column)
+            plot_items[plot_index] = widget
+            plot_curves[plot_index] = {}
+            return
+
         widget = pg.PlotWidget(
             title=plot_spec.title,
             viewBox=_PlotViewBox(
@@ -2059,6 +2215,16 @@ def _run_live_analysis_gui(
                     strict=True,
                 )
             ):
+                if plot_spec.widget == "empty":
+                    continue
+
+                if plot_spec.widget == "orientation_3d":
+                    roll = _latest_series_y(worker_snapshot.result, "mahony_roll")
+                    pitch = _latest_series_y(worker_snapshot.result, "mahony_pitch")
+                    yaw = _latest_series_y(worker_snapshot.result, "mahony_yaw")
+                    plot_item.set_orientation(roll, pitch, yaw)
+                    continue
+
                 plot_has_data = False
                 plot_x_min: float | None = None
                 plot_x_max: float | None = None

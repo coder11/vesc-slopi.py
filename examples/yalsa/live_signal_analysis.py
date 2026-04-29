@@ -80,6 +80,8 @@ DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
 DEFAULT_VESC_POLL_RATE = 1000
 # DEFAULT_VESC_POLL_RATE = None
+DEFAULT_SHOW_3D_OBJECT = True
+DEFAULT_SHOW_MAHONY = True
 # Span DC..Nyquist when the nominal poll rate is configured; omit for auto-ranging.
 FREQUENCY_PLOT_X_RANGE: tuple[float, float] | None = (
     None
@@ -1270,7 +1272,8 @@ def build_multi_axis_analysis_processor(
                     f"{axis} filtered RMS: {filtered_stats.rms:.6g} {unit}"
                 )
 
-        _add_mahony_rpy_series(series, timestamps, filtered_by_axis)
+        if DEFAULT_SHOW_MAHONY:
+            _add_mahony_rpy_series(series, timestamps, filtered_by_axis)
 
         if not has_samples:
             return AnalysisResult(series=series, status_text="waiting for samples")
@@ -1345,7 +1348,15 @@ def build_analysis(
                         allow_left_drag=False,
                     ),
                     PlotSpec(
-                        title="Mahony RPY",
+                        title=(
+                            "VESC 3D View"
+                            if (
+                                section == "gyro"
+                                and DEFAULT_SHOW_MAHONY
+                                and DEFAULT_SHOW_3D_OBJECT
+                            )
+                            else "Mahony RPY"
+                        ),
                         section=section,
                         group=group,
                         traces=_rpy_plot_traces(),
@@ -1362,6 +1373,19 @@ def build_analysis(
                         mouse_mode="rect",
                         x_axis_mode="follow_latest",
                         allow_left_drag=False,
+                        widget=(
+                            "orientation_3d"
+                            if (
+                                section == "gyro"
+                                and DEFAULT_SHOW_MAHONY
+                                and DEFAULT_SHOW_3D_OBJECT
+                            )
+                            else (
+                                "plot"
+                                if section == "accel" and DEFAULT_SHOW_MAHONY
+                                else "empty"
+                            )
+                        ),
                     ),
                 )
             )

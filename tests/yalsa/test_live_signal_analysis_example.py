@@ -434,6 +434,84 @@ def test_build_multi_axis_analysis_processor_feeds_filtered_data_to_mahony(
     assert captured["acc_x"] is not acc_x
 
 
+def test_build_multi_axis_analysis_processor_skips_mahony_when_hidden(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_signal_analysis, "DEFAULT_SHOW_MAHONY", False)
+
+    def fake_mahony_roll_pitch_yaw_deg(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Mahony algorithm should be disabled")
+
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "_mahony_roll_pitch_yaw_deg",
+        fake_mahony_roll_pitch_yaw_deg,
+    )
+    processor = build_multi_axis_analysis_processor(
+        ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"),
+        {
+            "acc_x": "g",
+            "acc_y": "g",
+            "acc_z": "g",
+            "gyro_x": "deg/s",
+            "gyro_y": "deg/s",
+            "gyro_z": "deg/s",
+        },
+    )
+    timestamps = np.arange(10, dtype=np.float64) / 100.0
+    zeros = np.zeros_like(timestamps)
+    params = {
+        f"{axis}_{suffix}": value
+        for axis in ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
+        for suffix, value in (
+            ("filter_type", "none"),
+            ("cutoff_hz", 10.0),
+            ("filter_order", 2),
+        )
+    }
+    params["spectrum_mode"] = "psd"
+
+    result = processor(
+        AnalysisInput(
+            batch=SignalBatch(
+                timestamps_s=timestamps,
+                values={
+                    "acc_x": zeros,
+                    "acc_y": zeros,
+                    "acc_z": np.ones_like(timestamps),
+                    "gyro_x": zeros,
+                    "gyro_y": zeros,
+                    "gyro_z": zeros,
+                },
+                units={
+                    "acc_x": "g",
+                    "acc_y": "g",
+                    "acc_z": "g",
+                    "gyro_x": "deg/s",
+                    "gyro_y": "deg/s",
+                    "gyro_z": "deg/s",
+                },
+            ),
+            sample_rate_hz=100.0,
+            source_stats=SignalBatchSourceStats(
+                samples=10,
+                dropped=0,
+                errors=0,
+                average_rate_hz=100.0,
+                latest_sample_s=float(timestamps[-1]),
+                latest_values={},
+                last_error=None,
+                done=False,
+            ),
+        ),
+        params,
+    )
+
+    assert "mahony_roll" not in result.series
+    assert "mahony_pitch" not in result.series
+    assert "mahony_yaw" not in result.series
+
+
 def test_build_analysis_exposes_live_tunable_parameters() -> None:
     config = LiveSignalAnalysisConfig(
         source="deterministic",
@@ -513,6 +591,8 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
         "Mahony RPY",
         "Accel Y Time Series",
     ]
+    assert app.plots[11].title == "Mahony RPY"
+    assert app.plots[11].widget == "empty"
     assert [metric.name for metric in app.metrics] == [
         "acc_x_rms",
         "acc_y_rms",
@@ -534,6 +614,32 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
         "Z",
     ]
     assert len(app.plots[0].traces) == 2
+
+
+def test_build_analysis_can_show_3d_object(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_signal_analysis, "DEFAULT_SHOW_3D_OBJECT", True)
+    config = LiveSignalAnalysisConfig(source="deterministic")
+    source, source_label = make_source(config)
+
+    app = build_analysis(source=source, source_label=source_label)
+
+    assert app.plots[11].title == "VESC 3D View"
+    assert app.plots[11].widget == "orientation_3d"
+
+
+def test_build_analysis_can_hide_mahony(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_signal_analysis, "DEFAULT_SHOW_MAHONY", False)
+    config = LiveSignalAnalysisConfig(source="deterministic")
+    source, source_label = make_source(config)
+
+    app = build_analysis(source=source, source_label=source_label)
+
+    assert app.plots[2].widget == "empty"
+    assert app.plots[11].widget == "empty"
 
 
 def test_build_runtime_config_reads_module_level_settings(
