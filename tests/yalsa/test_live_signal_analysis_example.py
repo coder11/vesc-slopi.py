@@ -4,7 +4,6 @@ import pytest
 import examples.yalsa.live_signal_analysis as live_signal_analysis
 from examples.yalsa.live_signal_analysis import (
     LiveSignalAnalysisConfig,
-    SlidingWindowRateEstimator,
     build_analysis,
     build_axis_analysis_processor,
     build_runtime_config,
@@ -35,16 +34,6 @@ def test_make_source_wraps_deterministic_source() -> None:
     assert source_label == "Deterministic source @ 321 Hz"
 
 
-def test_windowed_rate_estimator_reports_stable_event_rate() -> None:
-    estimator = SlidingWindowRateEstimator(window_s=2.0)
-
-    assert estimator.record(0) == pytest.approx(0.0)
-    for sample_index in range(1, 20):
-        rate_hz = estimator.record(sample_index * 2_000_000)
-
-    assert rate_hz == pytest.approx(500.0)
-
-
 def test_make_source_labels_vesc_snapshot_rate_as_poll_rate() -> None:
     config = LiveSignalAnalysisConfig(
         source="vesc",
@@ -59,6 +48,32 @@ def test_make_source_labels_vesc_snapshot_rate_as_poll_rate() -> None:
 
     assert snapshot.rate_label == "VESC poll rate"
     assert snapshot.average_rate_hz == pytest.approx(0.0)
+
+
+def test_vesc_snapshot_uses_acquisition_thread_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = live_signal_analysis.VescImuBatchSignalSource(
+        connection=VescConnection.serial("/dev/ttyACM0"),
+        axes=("acc_z", "gyro_z"),
+        timeout=live_signal_analysis.DEFAULT_TIMEOUT,
+        pending_samples=live_signal_analysis.DEFAULT_PENDING_SAMPLES,
+        poll_rate_hz=500.0,
+    )
+    source._average_rate_hz = 456.0
+
+    def fail_perf_counter_ns() -> int:
+        raise AssertionError("snapshot must not calculate poll rate")
+
+    monkeypatch.setattr(
+        live_signal_analysis.time,
+        "perf_counter_ns",
+        fail_perf_counter_ns,
+    )
+
+    snapshot = source.snapshot()
+
+    assert snapshot.average_rate_hz == pytest.approx(456.0)
 
 
 def test_make_source_passes_vesc_poll_rate(

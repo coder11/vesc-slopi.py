@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import threading
 import time
-from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -74,13 +73,12 @@ DEFAULT_MAX_POINTS = 1_200
 DEFAULT_PLOT_RATE = 30.0
 DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
-DEFAULT_VESC_POLL_RATE = 500
-# DEFAULT_VESC_POLL_RATE = None
+# DEFAULT_VESC_POLL_RATE = 1000
+DEFAULT_VESC_POLL_RATE = None
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
-VESC_POLL_RATE_WINDOW_S = 2.0
 RAW_TRACE_COLOR = "#afafaf"
 FILTERED_TRACE_COLOR = "#1f77b4"
 SOURCE_CHOICES = (
@@ -154,33 +152,6 @@ def empty_series() -> tuple[np.ndarray, np.ndarray]:
     """Return a shared empty x/y pair."""
     empty = np.empty(0, dtype=np.float64)
     return empty, empty
-
-
-class SlidingWindowRateEstimator:
-    """Estimate event rate over a recent time window."""
-
-    def __init__(self, window_s: float) -> None:
-        if window_s <= 0.0:
-            raise ValueError("window_s must be greater than 0")
-        self._window_ns = round(window_s * NSEC_PER_SEC)
-        self._timestamps_ns: deque[int] = deque()
-
-    def record(self, timestamp_ns: int) -> float:
-        """Record one event timestamp and return the current windowed rate."""
-        self._timestamps_ns.append(timestamp_ns)
-        cutoff_ns = timestamp_ns - self._window_ns
-        while self._timestamps_ns and self._timestamps_ns[0] < cutoff_ns:
-            self._timestamps_ns.popleft()
-        return self.rate_hz()
-
-    def rate_hz(self) -> float:
-        """Return the current event rate estimate."""
-        if len(self._timestamps_ns) < 2:
-            return 0.0
-        elapsed_ns = self._timestamps_ns[-1] - self._timestamps_ns[0]
-        if elapsed_ns <= 0:
-            return 0.0
-        return (len(self._timestamps_ns) - 1) * NSEC_PER_SEC / elapsed_ns
 
 
 class PendingSignalBatchBuffer:
@@ -490,7 +461,6 @@ class VescImuBatchSignalSource:
         self._start_ns = 0
         self._sample_count = 0
         self._dropped = 0
-        self._poll_rate = SlidingWindowRateEstimator(VESC_POLL_RATE_WINDOW_S)
         self._average_rate_hz = 0.0
         self._latest_sample_s: float | None = None
         self._latest_values: dict[str, float] = {}
@@ -593,7 +563,10 @@ class VescImuBatchSignalSource:
                     pending_values[axis].append(value)
                 with self._lock:
                     self._sample_count += 1
-                    self._average_rate_hz = self._poll_rate.record(now_ns)
+                    elapsed_s = (now_ns - self._start_ns) / NSEC_PER_SEC
+                    self._average_rate_hz = (
+                        self._sample_count / elapsed_s if elapsed_s > 0.0 else 0.0
+                    )
                     self._latest_sample_s = sample_s
                     self._latest_values = dict(values)
                     self._last_error = None
