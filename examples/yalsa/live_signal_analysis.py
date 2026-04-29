@@ -72,7 +72,8 @@ from yalsa import (
 
 DEFAULT_HISTORY = 5_000
 DEFAULT_MAX_POINTS = 1_200
-DEFAULT_PLOT_RATE = 30.0
+DEFAULT_PLOT_RATE = 60.0
+DEFAULT_WORKER_DRAIN_STRIDE = 2
 DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
 # DEFAULT_VESC_POLL_RATE = 1000
@@ -1006,6 +1007,7 @@ def build_analysis(
         source_label=source_label,
         history=DEFAULT_HISTORY,
         plot_rate_hz=DEFAULT_PLOT_RATE,
+        drain_stride=DEFAULT_WORKER_DRAIN_STRIDE,
         theme=DEFAULT_THEME,
         antialias=False,
         parameters=(

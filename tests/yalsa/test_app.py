@@ -296,6 +296,25 @@ def test_qt_theme_stylesheet_forces_light_widget_palette() -> None:
     assert "border: 1px solid #c7cdd4" in stylesheet
 
 
+def test_live_analysis_app_rejects_invalid_drain_stride() -> None:
+    source = _FiniteBatchSource([])
+    base = _single_plot_app(
+        source,
+        lambda d, p: AnalysisResult(
+            series={"raw": xy_series(d.timestamps_s, d.channel("acc_z"))},
+        ),
+    )
+    with pytest.raises(ValueError, match="drain_stride"):
+        LiveAnalysisApp(
+            title=base.title,
+            source=base.source,
+            plots=base.plots,
+            process=base.process,
+            history=base.history,
+            drain_stride=0,
+        )
+
+
 def test_live_analysis_worker_processes_source_batches_off_gui_thread() -> None:
     source = _FiniteBatchSource(
         [

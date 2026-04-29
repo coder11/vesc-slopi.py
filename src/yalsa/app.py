@@ -621,6 +621,7 @@ class LiveAnalysisApp:
     parameters: tuple[ParameterSpec, ...] = ()
     history: int = 20_000
     plot_rate_hz: float = 30.0
+    drain_stride: int = 1
     source_label: str | None = None
     theme: Literal["light", "dark"] = "light"
     antialias: bool = False
@@ -634,6 +635,8 @@ class LiveAnalysisApp:
             raise ValueError("history must be greater than 0")
         if self.plot_rate_hz <= 0.0:
             raise ValueError("plot_rate_hz must be greater than 0")
+        if self.drain_stride < 1:
+            raise ValueError("drain_stride must be at least 1")
         default_parameter_values(self.parameters)
 
 
@@ -990,6 +993,7 @@ class _LiveAnalysisWorker:
         self._source_stats = config.source.source_stats()
         self._history_rate_hz: float | None = None
         self._last_status_update_ns = 0
+        self._drain_phase = 0
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -1057,6 +1061,19 @@ class _LiveAnalysisWorker:
                 if self._clear_requested.is_set():
                     self._clear_requested.clear()
                     self._history.clear()
+                    self._drain_phase = 0
+
+                stride = max(1, self._config.drain_stride)
+                forced_process = self._process_requested.is_set()
+                if (
+                    stride > 1
+                    and not forced_process
+                    and (self._drain_phase % stride) != 0
+                ):
+                    self._drain_phase += 1
+                    self._update_source_status_if_due()
+                    self._stop.wait(_ANALYSIS_IDLE_SLEEP_S)
+                    continue
 
                 batch, drain_stats = self._config.source.drain()
                 has_new_samples = batch.sample_count > 0
@@ -1077,6 +1094,8 @@ class _LiveAnalysisWorker:
                 else:
                     self._update_source_status_if_due()
                     self._stop.wait(_ANALYSIS_IDLE_SLEEP_S)
+
+                self._drain_phase += 1
         except Exception as exc:  # noqa: BLE001 - worker errors are surfaced in UI.
             with self._state_lock:
                 self._last_process_error = f"analysis worker error: {exc}"
