@@ -94,6 +94,7 @@ FREQUENCY_PLOT_X_RANGE: tuple[float, float] | None = (
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_BIQUAD_Q = 0.707
 DEFAULT_FILTER_TYPE = "none"
+DEFAULT_SPECTRUM_TIMEFRAME_S = 2.0
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
 ACCEL_AXES = ("acc_x", "acc_y", "acc_z")
@@ -248,6 +249,53 @@ def empty_series() -> tuple[np.ndarray, np.ndarray]:
     """Return a shared empty x/y pair."""
     empty = np.empty(0, dtype=np.float64)
     return empty, empty
+
+
+def _spectrum_timeframe_seconds(params: Mapping[str, ParamValue]) -> float:
+    value = float(params.get("spectrum_timeframe_s", DEFAULT_SPECTRUM_TIMEFRAME_S))
+    if not np.isfinite(value) or value <= 0.0:
+        return DEFAULT_SPECTRUM_TIMEFRAME_S
+    return value
+
+
+def _trailing_timeframe_series(
+    timestamps: np.ndarray,
+    values: np.ndarray,
+    *,
+    timeframe_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    if timestamps.shape != values.shape:
+        raise ValueError("timestamps and values must have the same shape")
+    if int(timestamps.size) == 0:
+        return timestamps, values
+
+    cutoff_s = float(timestamps[-1]) - timeframe_s
+    start_index = int(np.searchsorted(timestamps, cutoff_s, side="right"))
+    return timestamps[start_index:], values[start_index:]
+
+
+def _axis_spectrum_series(
+    *,
+    spectrum_mode: str,
+    timestamps: np.ndarray,
+    values: np.ndarray,
+    timeframe_s: float,
+) -> SeriesData:
+    spectrum_timestamps, spectrum_values = _trailing_timeframe_series(
+        timestamps,
+        values,
+        timeframe_s=timeframe_s,
+    )
+    if spectrum_mode == "psd":
+        spectrum = welch_psd(spectrum_timestamps, spectrum_values)
+    elif spectrum_mode == "fft":
+        spectrum = fft_magnitude(spectrum_timestamps, spectrum_values)
+    else:
+        raise ValueError(f"unsupported spectrum_mode {spectrum_mode!r}")
+
+    if spectrum is None:
+        return xy_series(*empty_series())
+    return xy_series(spectrum[0], spectrum[1])
 
 
 @dataclass(slots=True)
@@ -897,6 +945,7 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
 
         sample_rate_hz = data.sample_rate_hz
         spectrum_mode = cast(str, params["spectrum_mode"])
+        spectrum_timeframe_s = _spectrum_timeframe_seconds(params)
         filter_type = cast(str, params["filter_type"])
         requested_cutoff_hz = float(cast(float, params["cutoff_hz"]))
         biquad_q = float(cast(float, params["biquad_q"]))
@@ -933,30 +982,24 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
         if filter_notes:
             tail = ", " + ", ".join(filter_notes)
 
-        if spectrum_mode == "psd":
-            raw_spectrum = welch_psd(timestamps, raw)
-            filtered_spectrum = welch_psd(timestamps, filtered)
-        else:
-            raw_spectrum = fft_magnitude(timestamps, raw)
-            filtered_spectrum = fft_magnitude(timestamps, filtered)
-
-        if raw_spectrum is None:
-            raw_spectrum_series = xy_series(*empty_series())
-        else:
-            raw_spectrum_series = xy_series(raw_spectrum[0], raw_spectrum[1])
-
-        if filtered_spectrum is None:
-            filtered_spectrum_series = xy_series(*empty_series())
-        else:
-            filtered_spectrum_series = xy_series(
-                filtered_spectrum[0],
-                filtered_spectrum[1],
-            )
+        raw_spectrum_series = _axis_spectrum_series(
+            spectrum_mode=spectrum_mode,
+            timestamps=timestamps,
+            values=raw,
+            timeframe_s=spectrum_timeframe_s,
+        )
+        filtered_spectrum_series = _axis_spectrum_series(
+            spectrum_mode=spectrum_mode,
+            timestamps=timestamps,
+            values=filtered,
+            timeframe_s=spectrum_timeframe_s,
+        )
 
         raw_stats = signal_stats(raw)
         filtered_stats = signal_stats(filtered)
         status_parts = [
             f"mode: {spectrum_mode.upper()}",
+            f"spectrum: {spectrum_timeframe_s:g} s",
             f"{filter_type}: {cutoff_text}{tail}",
         ]
         if raw_stats is not None:
@@ -993,6 +1036,7 @@ def build_dual_axis_analysis_processor(
         sample_rate_hz = data.sample_rate_hz
         requested_cutoff_hz = float(cast(float, params["cutoff_hz"]))
         spectrum_mode = cast(str, params["spectrum_mode"])
+        spectrum_timeframe_s = _spectrum_timeframe_seconds(params)
         filter_type = cast(str, params["filter_type"])
         biquad_q = float(cast(float, params["biquad_q"]))
         nominal_sr = float(sample_rate_hz) if sample_rate_hz is not None else None
@@ -1018,6 +1062,7 @@ def build_dual_axis_analysis_processor(
 
         status_parts = [
             f"mode: {spectrum_mode.upper()}",
+            f"spectrum: {spectrum_timeframe_s:g} s",
         ]
 
         has_samples = False
@@ -1048,25 +1093,18 @@ def build_dual_axis_analysis_processor(
                     tail = ", " + ", ".join(filter_notes)
                 tail_ready = True
 
-            if spectrum_mode == "psd":
-                raw_spectrum = welch_psd(timestamps, raw)
-                filtered_spectrum = welch_psd(timestamps, filtered)
-            else:
-                raw_spectrum = fft_magnitude(timestamps, raw)
-                filtered_spectrum = fft_magnitude(timestamps, filtered)
-
-            if raw_spectrum is None:
-                raw_spectrum_series = xy_series(*empty_series())
-            else:
-                raw_spectrum_series = xy_series(raw_spectrum[0], raw_spectrum[1])
-
-            if filtered_spectrum is None:
-                filtered_spectrum_series = xy_series(*empty_series())
-            else:
-                filtered_spectrum_series = xy_series(
-                    filtered_spectrum[0],
-                    filtered_spectrum[1],
-                )
+            raw_spectrum_series = _axis_spectrum_series(
+                spectrum_mode=spectrum_mode,
+                timestamps=timestamps,
+                values=raw,
+                timeframe_s=spectrum_timeframe_s,
+            )
+            filtered_spectrum_series = _axis_spectrum_series(
+                spectrum_mode=spectrum_mode,
+                timestamps=timestamps,
+                values=filtered,
+                timeframe_s=spectrum_timeframe_s,
+            )
 
             series[f"{prefix}_raw"] = xy_series(timestamps, raw)
             series[f"{prefix}_filtered"] = xy_series(timestamps, filtered)
@@ -1255,10 +1293,14 @@ def build_multi_axis_analysis_processor(
         timestamps = data.timestamps_s
         sample_rate_hz = data.sample_rate_hz
         spectrum_mode = cast(str, params["spectrum_mode"])
+        spectrum_timeframe_s = _spectrum_timeframe_seconds(params)
         series: dict[str, SeriesData] = {}
         filtered_by_axis: dict[str, np.ndarray] = {}
         metrics: dict[str, str] = {}
-        status_parts = [f"mode: {spectrum_mode.upper()}"]
+        status_parts = [
+            f"mode: {spectrum_mode.upper()}",
+            f"spectrum: {spectrum_timeframe_s:g} s",
+        ]
         has_samples = False
 
         nominal_sr = float(sample_rate_hz) if sample_rate_hz is not None else None
@@ -1318,25 +1360,18 @@ def build_multi_axis_analysis_processor(
             if filter_notes:
                 tail = ", " + ", ".join(filter_notes)
 
-            if spectrum_mode == "psd":
-                raw_spectrum = welch_psd(timestamps, raw)
-                filtered_spectrum = welch_psd(timestamps, filtered)
-            else:
-                raw_spectrum = fft_magnitude(timestamps, raw)
-                filtered_spectrum = fft_magnitude(timestamps, filtered)
-
-            if raw_spectrum is None:
-                raw_spectrum_series = xy_series(*empty_series())
-            else:
-                raw_spectrum_series = xy_series(raw_spectrum[0], raw_spectrum[1])
-
-            if filtered_spectrum is None:
-                filtered_spectrum_series = xy_series(*empty_series())
-            else:
-                filtered_spectrum_series = xy_series(
-                    filtered_spectrum[0],
-                    filtered_spectrum[1],
-                )
+            raw_spectrum_series = _axis_spectrum_series(
+                spectrum_mode=spectrum_mode,
+                timestamps=timestamps,
+                values=raw,
+                timeframe_s=spectrum_timeframe_s,
+            )
+            filtered_spectrum_series = _axis_spectrum_series(
+                spectrum_mode=spectrum_mode,
+                timestamps=timestamps,
+                values=filtered,
+                timeframe_s=spectrum_timeframe_s,
+            )
 
             series[_axis_series_name(axis, "raw")] = xy_series(timestamps, raw)
             series[_axis_series_name(axis, "filtered")] = xy_series(
@@ -1536,6 +1571,15 @@ def build_analysis(
                 label="Spectrum",
                 default="psd",
                 choices=SPECTRUM_OPTIONS,
+            ),
+            float_parameter(
+                "spectrum_timeframe_s",
+                label="Spectrum window",
+                default=DEFAULT_SPECTRUM_TIMEFRAME_S,
+                minimum=0.1,
+                maximum=60.0,
+                step=0.1,
+                decimals=2,
             ),
         ),
         metrics=tuple(

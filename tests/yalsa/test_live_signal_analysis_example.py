@@ -372,6 +372,66 @@ def test_build_multi_axis_analysis_processor_uses_independent_filters() -> None:
     assert "gyro_z: biquad, cutoff 40.00 Hz, Q=0.707" in result.status_text
 
 
+def test_build_multi_axis_analysis_processor_uses_spectrum_timeframe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_timestamps: list[np.ndarray] = []
+
+    def fake_welch_psd(
+        timestamps_s: np.ndarray,
+        values: np.ndarray,
+        *,
+        nperseg: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        del values, nperseg
+        captured_timestamps.append(timestamps_s.copy())
+        return (
+            np.array([0.0], dtype=np.float64),
+            np.array([1.0], dtype=np.float64),
+        )
+
+    monkeypatch.setattr(live_signal_analysis, "welch_psd", fake_welch_psd)
+    processor = build_multi_axis_analysis_processor(("acc_x",), {"acc_x": "g"})
+    timestamps = np.arange(10, dtype=np.float64)
+    values = np.arange(10, dtype=np.float64)
+    analysis_input = AnalysisInput(
+        batch=SignalBatch(
+            timestamps_s=timestamps,
+            values={"acc_x": values},
+            units={"acc_x": "g"},
+        ),
+        sample_rate_hz=1.0,
+        source_stats=SignalBatchSourceStats(
+            samples=10,
+            dropped=0,
+            errors=0,
+            average_rate_hz=1.0,
+            latest_sample_s=float(timestamps[-1]),
+            latest_values={"acc_x": float(values[-1])},
+            last_error=None,
+            done=False,
+        ),
+    )
+
+    result = processor(
+        analysis_input,
+        {
+            "acc_x_filter_type": "none",
+            "acc_x_cutoff_hz": 10.0,
+            "acc_x_biquad_q": 0.707,
+            "spectrum_mode": "psd",
+            "spectrum_timeframe_s": 3.0,
+        },
+    )
+
+    assert len(captured_timestamps) == 2
+    np.testing.assert_array_equal(captured_timestamps[0], np.array([7.0, 8.0, 9.0]))
+    np.testing.assert_array_equal(captured_timestamps[1], np.array([7.0, 8.0, 9.0]))
+    assert result.series["acc_x_raw_spectrum"].x.tolist() == [0.0]
+    assert result.status_text is not None
+    assert "spectrum: 3 s" in result.status_text
+
+
 def test_build_multi_axis_analysis_processor_adds_mahony_rpy_series() -> None:
     processor = build_multi_axis_analysis_processor(
         ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"),
@@ -640,6 +700,7 @@ def test_build_analysis_exposes_live_tunable_parameters(
         "gyro_z_cutoff_hz",
         "gyro_z_biquad_q",
         "spectrum_mode",
+        "spectrum_timeframe_s",
     ]
     assert app.theme == "light"
     assert len(app.plots) == 18
