@@ -208,6 +208,17 @@ def test_plot_spec_rejects_invalid_y_range() -> None:
         )
 
 
+def test_plot_spec_rejects_invalid_x_range() -> None:
+    with pytest.raises(ValueError, match="x_range"):
+        PlotSpec(
+            title="t",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="x",
+            y_label="y",
+            x_range=(10.0, 0.0),
+        )
+
+
 def test_plot_spec_rejects_invalid_mouse_mode() -> None:
     with pytest.raises(ValueError, match="mouse_mode must be 'pan' or 'rect'"):
         PlotSpec(

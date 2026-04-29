@@ -566,6 +566,8 @@ class PlotSpec:
     allow_left_drag: bool = True
     # If set, Y limits are applied after any initial autoRange (e.g. ±1.2 g for accel time plots).
     y_range: tuple[float, float] | None = None
+    # If set, X limits are applied after any initial autoRange (e.g. fixed spectrum span).
+    x_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if not self.traces:
@@ -580,6 +582,10 @@ class PlotSpec:
             y_min, y_max = self.y_range
             if y_min >= y_max:
                 raise ValueError("y_range must be (min, max) with min < max")
+        if self.x_range is not None:
+            x_min, x_max = self.x_range
+            if x_min >= x_max:
+                raise ValueError("x_range must be (min, max) with min < max")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1230,7 +1236,11 @@ def _configure_plot_interaction(plot_item: Any, plot_spec: PlotSpec) -> None:
         y=plot_spec.allow_mouse_y,
     )
     view_box.enableAutoRange(
-        x=plot_spec.auto_range_x and plot_spec.x_axis_mode == "auto",
+        x=(
+            plot_spec.auto_range_x
+            and plot_spec.x_axis_mode == "auto"
+            and plot_spec.x_range is None
+        ),
         y=plot_spec.auto_range_y,
     )
 
@@ -1773,6 +1783,11 @@ def _run_live_analysis_gui(
                     if plot_spec.y_range is not None:
                         y_min, y_max = plot_spec.y_range
                         plot_item.setYRange(y_min, y_max, padding=0.0)
+                    if plot_spec.x_range is not None:
+                        x_rng_min, x_rng_max = plot_spec.x_range
+                        plot_item.setXRange(
+                            x_rng_min, x_rng_max, padding=0.0
+                        )
                 if (
                     plot_spec.x_axis_mode == "follow_latest"
                     and plot_x_min is not None

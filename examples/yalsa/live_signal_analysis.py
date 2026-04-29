@@ -76,8 +76,14 @@ DEFAULT_PLOT_RATE = 60.0
 DEFAULT_WORKER_DRAIN_STRIDE = 2
 DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
-DEFAULT_VESC_POLL_RATE = 1000
-# DEFAULT_VESC_POLL_RATE = None
+# DEFAULT_VESC_POLL_RATE = 1000
+DEFAULT_VESC_POLL_RATE = None
+# Span DC..Nyquist when the nominal poll rate is configured; omit for auto-ranging.
+FREQUENCY_PLOT_X_RANGE: tuple[float, float] | None = (
+    None
+    if DEFAULT_VESC_POLL_RATE is None
+    else (0.0, float(DEFAULT_VESC_POLL_RATE) / 2.0)
+)
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
@@ -895,8 +901,9 @@ def build_analysis(
                 x_unit="Hz",
                 y_label="spectrum",
                 max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=True,
+                auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
                 auto_range_y=False,
+                x_range=FREQUENCY_PLOT_X_RANGE,
                 allow_mouse_x=False,
                 allow_mouse_y=True,
                 mouse_mode="rect",
@@ -949,8 +956,9 @@ def build_analysis(
                 x_unit="Hz",
                 y_label="spectrum",
                 max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=True,
+                auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
                 auto_range_y=False,
+                x_range=FREQUENCY_PLOT_X_RANGE,
                 allow_mouse_x=False,
                 allow_mouse_y=True,
                 mouse_mode="rect",
@@ -997,8 +1005,9 @@ def build_analysis(
                 x_unit="Hz",
                 y_label="spectrum",
                 max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=True,
+                auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
                 auto_range_y=False,
+                x_range=FREQUENCY_PLOT_X_RANGE,
                 allow_mouse_x=False,
                 allow_mouse_y=True,
                 mouse_mode="rect",
