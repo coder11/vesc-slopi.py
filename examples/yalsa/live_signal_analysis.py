@@ -115,7 +115,7 @@ SOURCE_CHOICES = (
 )
 DEFAULT_TIMEOUT = 0.1
 MAHONY_ACC_CONFIDENCE_DECAY = 1.0
-MAHONY_KP = 0.3
+MAHONY_KP = 0.2
 MAHONY_KI = 0.0
 RAD_TO_DEG = 180.0 / pi
 DEG_TO_RAD = pi / 180.0
@@ -210,9 +210,7 @@ def _truncate(value: float, minimum: float, maximum: float) -> float:
 def _calculate_acc_confidence(attitude: MahonyAttitude, acc_mag: float) -> float:
     acc_mag = attitude.acc_mag_p * 0.9 + acc_mag * 0.1
     attitude.acc_mag_p = acc_mag
-    confidence = 1.0 - (
-        MAHONY_ACC_CONFIDENCE_DECAY * sqrt(abs(acc_mag - 1.0))
-    )
+    confidence = 1.0 - (MAHONY_ACC_CONFIDENCE_DECAY * sqrt(abs(acc_mag - 1.0)))
     return _truncate(confidence, 0.0, 1.0)
 
 
@@ -329,18 +327,11 @@ def _mahony_roll_pitch_yaw_deg(
         q1 = attitude.q1
         q2 = attitude.q2
         q3 = attitude.q3
-        roll[index] = (
-            -atan2(q0 * q1 + q2 * q3, 0.5 - (q1 * q1 + q2 * q2))
-            * RAD_TO_DEG
-        )
+        roll[index] = -atan2(q0 * q1 + q2 * q3, 0.5 - (q1 * q1 + q2 * q2)) * RAD_TO_DEG
         pitch[index] = (
-            asin(_truncate(-2.0 * (q1 * q3 - q0 * q2), -1.0, 1.0))
-            * RAD_TO_DEG
+            asin(_truncate(-2.0 * (q1 * q3 - q0 * q2), -1.0, 1.0)) * RAD_TO_DEG
         )
-        yaw[index] = (
-            -atan2(q0 * q3 + q1 * q2, 0.5 - (q2 * q2 + q3 * q3))
-            * RAD_TO_DEG
-        )
+        yaw[index] = -atan2(q0 * q3 + q1 * q2, 0.5 - (q2 * q2 + q3 * q3)) * RAD_TO_DEG
 
     return roll, pitch, yaw
 
