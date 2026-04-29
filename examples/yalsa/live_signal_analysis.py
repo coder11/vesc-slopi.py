@@ -49,6 +49,7 @@ from yalsa import (
     AnalysisResult,
     ChoiceOption,
     LiveAnalysisApp,
+    MetricSpec,
     ParamValue,
     PlotSpec,
     PlotTrace,
@@ -88,10 +89,18 @@ DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
+ACCEL_AXES = ("acc_x", "acc_y", "acc_z")
+GYRO_AXES = ("gyro_x", "gyro_y", "gyro_z")
+IMU_ANALYSIS_AXES = ACCEL_AXES + GYRO_AXES
 # Default vertical span for acceleration time-domain plots (units: g).
 DEFAULT_ACCEL_TIME_Y_RANGE: tuple[float, float] = (-1.2, 1.2)
 RAW_TRACE_COLOR = "#afafaf"
 FILTERED_TRACE_COLOR = "#1f77b4"
+AXIS_TRACE_COLORS = {
+    "x": ("#f0a6a6", "#d62728"),
+    "y": ("#9bd39b", "#2ca02c"),
+    "z": ("#9db7e8", "#1f77b4"),
+}
 SOURCE_CHOICES = (
     DEFAULT_SOURCE,
     "deterministic",
@@ -111,6 +120,10 @@ RUN_GYRO_AXIS = "gyro_z"
 SPECTRUM_OPTIONS = (
     ChoiceOption(value="psd", label="PSD"),
     ChoiceOption(value="fft", label="FFT"),
+)
+FILTER_OPTIONS = (
+    ChoiceOption(value="lowpass", label="Lowpass"),
+    ChoiceOption(value="none", label="None"),
 )
 
 
@@ -136,7 +149,7 @@ class LiveSignalAnalysisConfig:
             raise ValueError("timeout must be greater than 0")
         object.__setattr__(self, "axis", parse_imu_axis(self.axis))
         object.__setattr__(self, "gyro_axis", parse_imu_axis(self.gyro_axis))
-        parse_imu_axes((self.axis, self.gyro_axis))
+        parse_imu_axes(IMU_ANALYSIS_AXES)
 
 
 def build_runtime_config() -> LiveSignalAnalysisConfig:
@@ -845,180 +858,276 @@ def _accel_time_plot_y_range(axis: str) -> tuple[float, float] | None:
     return DEFAULT_ACCEL_TIME_Y_RANGE if axis.startswith("acc_") else None
 
 
+def _axis_cutoff_parameter_name(axis: str) -> str:
+    return f"{axis}_cutoff_hz"
+
+
+def _axis_filter_type_parameter_name(axis: str) -> str:
+    return f"{axis}_filter_type"
+
+
+def _axis_filter_order_parameter_name(axis: str) -> str:
+    return f"{axis}_filter_order"
+
+
+def _axis_series_name(axis: str, suffix: str) -> str:
+    return f"{axis}_{suffix}"
+
+
+def _axis_section(axis: str) -> str:
+    family, _component = axis.split("_", maxsplit=1)
+    return "accel" if family == "acc" else "gyro"
+
+
+def _axis_component(axis: str) -> str:
+    _family, component = axis.split("_", maxsplit=1)
+    return component
+
+
+def _axis_group_label(axis: str) -> str:
+    return _axis_component(axis).upper()
+
+
+def _axis_section_label(section: str) -> str:
+    return "Accel" if section == "accel" else "Gyro"
+
+
+def _axis_metric_name(axis: str) -> str:
+    return f"{axis}_rms"
+
+
+def _axis_tab_label(axis: str) -> str:
+    family, component = axis.split("_", maxsplit=1)
+    family_label = "Accel" if family == "acc" else "Gyro"
+    return f"{family_label} {component.upper()}"
+
+
+def _axis_parameter_label(axis: str, label: str) -> str:
+    return f"{axis} {label}"
+
+
+def _axis_plot_traces(axis: str, suffix: str) -> tuple[PlotTrace, ...]:
+    component = _axis_component(axis)
+    raw_color, filtered_color = AXIS_TRACE_COLORS[component]
+    return (
+        PlotTrace(
+            series=_axis_series_name(axis, f"raw{suffix}"),
+            label="Raw",
+            color=raw_color,
+            width=1.0,
+        ),
+        PlotTrace(
+            series=_axis_series_name(axis, f"filtered{suffix}"),
+            label="Filtered",
+            color=filtered_color,
+            width=1.8,
+        ),
+    )
+
+
+def build_multi_axis_analysis_processor(
+    axes: Sequence[str],
+    units: Mapping[str, str],
+) -> ProcessCallback:
+    """Return a processing callback for all configured IMU axes."""
+    selected_axes = parse_imu_axes(axes)
+
+    def process(
+        data: AnalysisInput,
+        params: Mapping[str, ParamValue],
+    ) -> AnalysisResult:
+        timestamps = data.timestamps_s
+        sample_rate_hz = data.sample_rate_hz
+        spectrum_mode = cast(str, params["spectrum_mode"])
+        series: dict[str, SeriesData] = {}
+        metrics: dict[str, str] = {}
+        status_parts = [f"mode: {spectrum_mode.upper()}"]
+        has_samples = False
+
+        for axis in selected_axes:
+            raw = data.channel(axis)
+            if int(raw.size) == 0:
+                empty_x, empty_y = empty_series()
+                series[_axis_series_name(axis, "raw")] = xy_series(empty_x, empty_y)
+                series[_axis_series_name(axis, "filtered")] = xy_series(
+                    empty_x,
+                    empty_y,
+                )
+                series[_axis_series_name(axis, "raw_spectrum")] = xy_series(
+                    empty_x,
+                    empty_y,
+                )
+                series[_axis_series_name(axis, "filtered_spectrum")] = xy_series(
+                    empty_x,
+                    empty_y,
+                )
+                continue
+
+            has_samples = True
+            requested_cutoff_hz = float(
+                cast(float, params[_axis_cutoff_parameter_name(axis)])
+            )
+            cutoff_hz = clamp_cutoff_hz(requested_cutoff_hz, sample_rate_hz)
+            filter_type = cast(str, params[_axis_filter_type_parameter_name(axis)])
+            filter_order = int(
+                cast(int, params[_axis_filter_order_parameter_name(axis)])
+            )
+
+            filtered = raw.copy()
+            if (
+                filter_type == "lowpass"
+                and cutoff_hz is not None
+                and int(raw.size) >= 2
+            ):
+                filtered = butter_lowpass_hz(
+                    raw,
+                    cutoff_hz=cutoff_hz,
+                    sample_rate_hz=cast(float, sample_rate_hz),
+                    order=filter_order,
+                    initial_value=float(raw[0]),
+                )
+
+            if spectrum_mode == "psd":
+                raw_spectrum = welch_psd(timestamps, raw)
+                filtered_spectrum = welch_psd(timestamps, filtered)
+            else:
+                raw_spectrum = fft_magnitude(timestamps, raw)
+                filtered_spectrum = fft_magnitude(timestamps, filtered)
+
+            if raw_spectrum is None:
+                raw_spectrum_series = xy_series(*empty_series())
+            else:
+                raw_spectrum_series = xy_series(raw_spectrum[0], raw_spectrum[1])
+
+            if filtered_spectrum is None:
+                filtered_spectrum_series = xy_series(*empty_series())
+            else:
+                filtered_spectrum_series = xy_series(
+                    filtered_spectrum[0],
+                    filtered_spectrum[1],
+                )
+
+            series[_axis_series_name(axis, "raw")] = xy_series(timestamps, raw)
+            series[_axis_series_name(axis, "filtered")] = xy_series(
+                timestamps,
+                filtered,
+            )
+            series[_axis_series_name(axis, "raw_spectrum")] = raw_spectrum_series
+            series[_axis_series_name(axis, "filtered_spectrum")] = (
+                filtered_spectrum_series
+            )
+
+            cutoff_text = (
+                "disabled"
+                if filter_type == "none"
+                else (
+                    "cutoff measuring"
+                    if cutoff_hz is None
+                    else f"cutoff {cutoff_hz:.2f} Hz"
+                )
+            )
+            status_parts.append(
+                f"{axis}: {filter_type}, {cutoff_text}, order {filter_order}"
+            )
+            if (
+                filter_type == "lowpass"
+                and cutoff_hz is not None
+                and cutoff_hz != requested_cutoff_hz
+            ):
+                status_parts.append(
+                    f"{axis} requested cutoff clamped from {requested_cutoff_hz:.2f} Hz"
+                )
+
+            raw_stats = signal_stats(raw)
+            filtered_stats = signal_stats(filtered)
+            unit = units[axis]
+            if raw_stats is not None:
+                metrics[_axis_metric_name(axis)] = f"{raw_stats.rms:.6g} {unit}"
+                status_parts.append(f"{axis} raw RMS: {raw_stats.rms:.6g} {unit}")
+            if filtered_stats is not None:
+                status_parts.append(
+                    f"{axis} filtered RMS: {filtered_stats.rms:.6g} {unit}"
+                )
+
+        if not has_samples:
+            return AnalysisResult(series=series, status_text="waiting for samples")
+
+        return AnalysisResult(
+            series=series,
+            status_text=" | ".join(status_parts),
+            metrics=metrics,
+        )
+
+    return process
+
+
 def build_analysis(
     *,
     source: SignalBatchSource,
     source_label: str,
-    axis: str,
-    unit: str,
+    axis: str | None = None,
+    unit: str | None = None,
     gyro_axis: str | None = None,
     gyro_unit: str | None = None,
 ) -> LiveAnalysisApp:
     """Build the declarative analysis app consumed by the generic runtime."""
-    plots: tuple[PlotSpec, ...]
-    process: ProcessCallback
-    if gyro_axis is None or gyro_unit is None:
-        plots = (
-            PlotSpec(
-                title="Time Domain",
-                traces=(
-                    PlotTrace(series="raw", label="Raw", color=RAW_TRACE_COLOR),
-                    PlotTrace(
-                        series="filtered",
-                        label="Filtered",
-                        color=FILTERED_TRACE_COLOR,
+    del axis, unit, gyro_axis, gyro_unit
+
+    axes = IMU_ANALYSIS_AXES
+    units = {axis_name: imu_axis_unit(axis_name) for axis_name in axes}
+    plots: list[PlotSpec] = []
+    for section, section_axes in (
+        ("accel", ACCEL_AXES),
+        ("gyro", GYRO_AXES),
+    ):
+        section_label = _axis_section_label(section)
+        for axis_name in section_axes:
+            group = _axis_group_label(axis_name)
+            plots.extend(
+                (
+                    PlotSpec(
+                        title=f"{section_label} {group} Time Series",
+                        section=section,
+                        group=group,
+                        traces=_axis_plot_traces(axis_name, ""),
+                        x_label="time",
+                        x_unit="s",
+                        y_label=axis_name,
+                        y_unit=units[axis_name],
+                        max_points=DEFAULT_MAX_POINTS,
+                        auto_range_x=True,
+                        auto_range_y=False,
+                        y_range=_accel_time_plot_y_range(axis_name),
+                        allow_mouse_x=False,
+                        allow_mouse_y=True,
+                        mouse_mode="rect",
+                        x_axis_mode="follow_latest",
+                        allow_left_drag=False,
                     ),
-                ),
-                x_label="time",
-                x_unit="s",
-                y_label=axis,
-                y_unit=unit,
-                max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=True,
-                auto_range_y=False,
-                y_range=_accel_time_plot_y_range(axis),
-                allow_mouse_x=False,
-                allow_mouse_y=True,
-                mouse_mode="rect",
-                x_axis_mode="follow_latest",
-                allow_left_drag=False,
-            ),
-            PlotSpec(
-                title="Frequency Domain",
-                traces=(
-                    PlotTrace(
-                        series="raw_spectrum",
-                        label="Raw",
-                        color=RAW_TRACE_COLOR,
+                    PlotSpec(
+                        title=f"{section_label} {group} Frequency",
+                        section=section,
+                        group=group,
+                        traces=_axis_plot_traces(axis_name, "_spectrum"),
+                        x_label="frequency",
+                        x_unit="Hz",
+                        y_label="spectrum",
+                        max_points=DEFAULT_MAX_POINTS,
+                        auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
+                        auto_range_y=False,
+                        x_range=FREQUENCY_PLOT_X_RANGE,
+                        allow_mouse_x=False,
+                        allow_mouse_y=True,
+                        mouse_mode="rect",
+                        allow_left_drag=False,
                     ),
-                    PlotTrace(
-                        series="filtered_spectrum",
-                        label="Filtered",
-                        color=FILTERED_TRACE_COLOR,
-                    ),
-                ),
-                x_label="frequency",
-                x_unit="Hz",
-                y_label="spectrum",
-                max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
-                auto_range_y=False,
-                x_range=FREQUENCY_PLOT_X_RANGE,
-                allow_mouse_x=False,
-                allow_mouse_y=True,
-                mouse_mode="rect",
-                allow_left_drag=False,
-            ),
-        )
-        process = build_axis_analysis_processor(axis, unit)
-        title = f"Live Signal Analysis: {axis}"
-    else:
-        plots = (
-            PlotSpec(
-                title=f"Accel Time Domain: {axis}",
-                traces=(
-                    PlotTrace(series="accel_raw", label="Raw", color=RAW_TRACE_COLOR),
-                    PlotTrace(
-                        series="accel_filtered",
-                        label="Filtered",
-                        color=FILTERED_TRACE_COLOR,
-                    ),
-                ),
-                x_label="time",
-                x_unit="s",
-                y_label=axis,
-                y_unit=unit,
-                max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=True,
-                auto_range_y=False,
-                y_range=DEFAULT_ACCEL_TIME_Y_RANGE,
-                allow_mouse_x=False,
-                allow_mouse_y=True,
-                mouse_mode="rect",
-                x_axis_mode="follow_latest",
-                allow_left_drag=False,
-            ),
-            PlotSpec(
-                title=f"Accel Frequency Domain: {axis}",
-                traces=(
-                    PlotTrace(
-                        series="accel_raw_spectrum",
-                        label="Raw",
-                        color=RAW_TRACE_COLOR,
-                    ),
-                    PlotTrace(
-                        series="accel_filtered_spectrum",
-                        label="Filtered",
-                        color=FILTERED_TRACE_COLOR,
-                    ),
-                ),
-                x_label="frequency",
-                x_unit="Hz",
-                y_label="spectrum",
-                max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
-                auto_range_y=False,
-                x_range=FREQUENCY_PLOT_X_RANGE,
-                allow_mouse_x=False,
-                allow_mouse_y=True,
-                mouse_mode="rect",
-                allow_left_drag=False,
-            ),
-            PlotSpec(
-                title=f"Gyro Time Domain: {gyro_axis}",
-                traces=(
-                    PlotTrace(series="gyro_raw", label="Raw", color=RAW_TRACE_COLOR),
-                    PlotTrace(
-                        series="gyro_filtered",
-                        label="Filtered",
-                        color=FILTERED_TRACE_COLOR,
-                    ),
-                ),
-                x_label="time",
-                x_unit="s",
-                y_label=gyro_axis,
-                y_unit=gyro_unit,
-                max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=True,
-                auto_range_y=False,
-                allow_mouse_x=False,
-                allow_mouse_y=True,
-                mouse_mode="rect",
-                x_axis_mode="follow_latest",
-                allow_left_drag=False,
-            ),
-            PlotSpec(
-                title=f"Gyro Frequency Domain: {gyro_axis}",
-                traces=(
-                    PlotTrace(
-                        series="gyro_raw_spectrum",
-                        label="Raw",
-                        color=RAW_TRACE_COLOR,
-                    ),
-                    PlotTrace(
-                        series="gyro_filtered_spectrum",
-                        label="Filtered",
-                        color=FILTERED_TRACE_COLOR,
-                    ),
-                ),
-                x_label="frequency",
-                x_unit="Hz",
-                y_label="spectrum",
-                max_points=DEFAULT_MAX_POINTS,
-                auto_range_x=FREQUENCY_PLOT_X_RANGE is None,
-                auto_range_y=False,
-                x_range=FREQUENCY_PLOT_X_RANGE,
-                allow_mouse_x=False,
-                allow_mouse_y=True,
-                mouse_mode="rect",
-                allow_left_drag=False,
-            ),
-        )
-        process = build_dual_axis_analysis_processor(axis, unit, gyro_axis, gyro_unit)
-        title = f"Live Signal Analysis: {axis} + {gyro_axis}"
+                )
+            )
+
+    process = build_multi_axis_analysis_processor(axes, units)
 
     return LiveAnalysisApp(
-        title=title,
+        title="Live Signal Analysis: IMU axes",
         source=source,
         source_label=source_label,
         history=DEFAULT_HISTORY,
@@ -1026,24 +1135,42 @@ def build_analysis(
         drain_stride=DEFAULT_WORKER_DRAIN_STRIDE,
         theme=DEFAULT_THEME,
         antialias=False,
-        parameters=(
-            float_parameter(
-                "cutoff_hz",
-                label="Cutoff Hz",
-                default=DEFAULT_CUTOFF_HZ,
-                minimum=0.1,
-                maximum=500.0,
-                step=0.5,
-                decimals=2,
-            ),
-            int_parameter(
-                "filter_order",
-                label="Order",
-                default=DEFAULT_FILTER_ORDER,
-                minimum=1,
-                maximum=8,
-                step=1,
-            ),
+        parameters=tuple(
+            parameter
+            for axis_name in axes
+            for parameter in (
+                choice_parameter(
+                    _axis_filter_type_parameter_name(axis_name),
+                    label="filter",
+                    default="lowpass",
+                    choices=FILTER_OPTIONS,
+                    section=_axis_section(axis_name),
+                    group=_axis_group_label(axis_name),
+                ),
+                float_parameter(
+                    _axis_cutoff_parameter_name(axis_name),
+                    label="cutoff",
+                    default=DEFAULT_CUTOFF_HZ,
+                    minimum=0.1,
+                    maximum=500.0,
+                    step=0.5,
+                    decimals=2,
+                    section=_axis_section(axis_name),
+                    group=_axis_group_label(axis_name),
+                ),
+                int_parameter(
+                    _axis_filter_order_parameter_name(axis_name),
+                    label="order",
+                    default=DEFAULT_FILTER_ORDER,
+                    minimum=1,
+                    maximum=8,
+                    step=1,
+                    section=_axis_section(axis_name),
+                    group=_axis_group_label(axis_name),
+                ),
+            )
+        )
+        + (
             choice_parameter(
                 "spectrum_mode",
                 label="Spectrum",
@@ -1051,7 +1178,16 @@ def build_analysis(
                 choices=SPECTRUM_OPTIONS,
             ),
         ),
-        plots=plots,
+        metrics=tuple(
+            MetricSpec(
+                name=_axis_metric_name(axis_name),
+                label="RMS",
+                section=_axis_section(axis_name),
+                group=_axis_group_label(axis_name),
+            )
+            for axis_name in axes
+        ),
+        plots=tuple(plots),
         process=process,
     )
 
@@ -1062,7 +1198,7 @@ def make_source(
     vesc_target: VescTarget | None = None,
 ) -> tuple[SignalBatchSource, str]:
     """Create the selected source and a UI label for it."""
-    axes = (config.axis, config.gyro_axis)
+    axes = IMU_ANALYSIS_AXES
     if config.source == DEFAULT_SOURCE:
         if vesc_target is None:
             raise ValueError("vesc_target is required when source='vesc'")
@@ -1118,15 +1254,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
 
     source, source_label = make_source(config, vesc_target=vesc_target)
-    unit = imu_axis_unit(config.axis)
-    gyro_unit = imu_axis_unit(config.gyro_axis)
     app = build_analysis(
         source=source,
         source_label=source_label,
-        axis=config.axis,
-        unit=unit,
-        gyro_axis=config.gyro_axis,
-        gyro_unit=gyro_unit,
     )
     run_live_analysis(app)
 

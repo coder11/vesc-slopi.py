@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import cycle
 from multiprocessing import shared_memory as mp_shared_memory
 from multiprocessing.context import BaseContext
@@ -38,6 +38,7 @@ _SUPERVISOR_POLL_S = 0.2
 # Rolling window for smoothing measured VESC poll rate in the GUI (not the poll loop).
 _VESC_POLL_RATE_DISPLAY_SMA_WINDOW = 16
 _PROCESS_STOP_TIMEOUT_S = 2.0
+_SECTION_SIDEBAR_WIDTH = 280
 _SHARED_SLOT_MAGIC = b"YALSA001"
 _SHARED_SLOT_HEADER = struct.Struct("<8sQQQQ")
 
@@ -370,6 +371,26 @@ class ChoiceOption:
 
 
 @dataclass(frozen=True, slots=True)
+class MetricSpec:
+    """One live metric rendered in a section sidebar."""
+
+    name: str
+    label: str
+    section: str
+    group: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("metric name must not be empty")
+        if not self.label:
+            raise ValueError("metric label must not be empty")
+        if not self.section:
+            raise ValueError("metric section must not be empty")
+        if self.group is not None and not self.group:
+            raise ValueError("metric group must not be empty")
+
+
+@dataclass(frozen=True, slots=True)
 class ParameterSpec:
     """Description of one live-tunable parameter."""
 
@@ -382,12 +403,18 @@ class ParameterSpec:
     step: int | float | None = None
     decimals: int | None = None
     choices: tuple[ChoiceOption, ...] = ()
+    section: str | None = None
+    group: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name:
             raise ValueError("parameter name must not be empty")
         if not self.label:
             raise ValueError("parameter label must not be empty")
+        if self.section is not None and not self.section:
+            raise ValueError("parameter section must not be empty")
+        if self.group is not None and not self.group:
+            raise ValueError("parameter group must not be empty")
         if self.kind == "int":
             if not _is_int_value(self.default):
                 raise TypeError("int parameter default must be an int")
@@ -433,6 +460,8 @@ def int_parameter(
     minimum: int | None = None,
     maximum: int | None = None,
     step: int | None = None,
+    section: str | None = None,
+    group: str | None = None,
 ) -> ParameterSpec:
     """Build an integer parameter spec."""
     return ParameterSpec(
@@ -443,6 +472,8 @@ def int_parameter(
         minimum=minimum,
         maximum=maximum,
         step=step,
+        section=section,
+        group=group,
     )
 
 
@@ -455,6 +486,8 @@ def float_parameter(
     maximum: float | None = None,
     step: float | None = None,
     decimals: int = 3,
+    section: str | None = None,
+    group: str | None = None,
 ) -> ParameterSpec:
     """Build a floating-point parameter spec."""
     return ParameterSpec(
@@ -466,6 +499,8 @@ def float_parameter(
         maximum=maximum,
         step=step,
         decimals=decimals,
+        section=section,
+        group=group,
     )
 
 
@@ -474,6 +509,8 @@ def bool_parameter(
     *,
     default: bool,
     label: str | None = None,
+    section: str | None = None,
+    group: str | None = None,
 ) -> ParameterSpec:
     """Build a boolean parameter spec."""
     return ParameterSpec(
@@ -481,6 +518,8 @@ def bool_parameter(
         label=label or name,
         kind="bool",
         default=default,
+        section=section,
+        group=group,
     )
 
 
@@ -490,6 +529,8 @@ def choice_parameter(
     default: str,
     choices: tuple[ChoiceOption, ...],
     label: str | None = None,
+    section: str | None = None,
+    group: str | None = None,
 ) -> ParameterSpec:
     """Build a discrete-choice parameter spec."""
     return ParameterSpec(
@@ -498,6 +539,8 @@ def choice_parameter(
         kind="choice",
         default=default,
         choices=choices,
+        section=section,
+        group=group,
     )
 
 
@@ -511,6 +554,14 @@ def default_parameter_values(
             raise ValueError(f"duplicate parameter name {parameter.name!r}")
         defaults[parameter.name] = parameter.default
     return defaults
+
+
+def _validate_metric_specs(metrics: tuple[MetricSpec, ...]) -> None:
+    names: set[str] = set()
+    for metric in metrics:
+        if metric.name in names:
+            raise ValueError(f"duplicate metric name {metric.name!r}")
+        names.add(metric.name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +603,9 @@ class PlotSpec:
     traces: tuple[PlotTrace, ...]
     x_label: str
     y_label: str
+    tab: str | None = None
+    section: str | None = None
+    group: str | None = None
     x_unit: str = ""
     y_unit: str = ""
     max_points: int | None = None
@@ -572,6 +626,12 @@ class PlotSpec:
     def __post_init__(self) -> None:
         if not self.traces:
             raise ValueError("plots must contain at least one trace")
+        if self.tab is not None and not self.tab:
+            raise ValueError("plot tab must not be empty")
+        if self.section is not None and not self.section:
+            raise ValueError("plot section must not be empty")
+        if self.group is not None and not self.group:
+            raise ValueError("plot group must not be empty")
         if self.max_points is not None and self.max_points <= 0:
             raise ValueError("max_points must be greater than 0")
         if self.mouse_mode not in ("pan", "rect"):
@@ -618,6 +678,7 @@ class AnalysisResult:
 
     series: Mapping[str, SeriesData]
     status_text: str | None = None
+    metrics: Mapping[str, str] = field(default_factory=dict)
 
 
 ProcessCallback: TypeAlias = Callable[
@@ -634,6 +695,7 @@ class LiveAnalysisApp:
     plots: tuple[PlotSpec, ...]
     process: ProcessCallback
     parameters: tuple[ParameterSpec, ...] = ()
+    metrics: tuple[MetricSpec, ...] = ()
     history: int = 20_000
     plot_rate_hz: float = 30.0
     drain_stride: int = 1
@@ -653,6 +715,7 @@ class LiveAnalysisApp:
         if self.drain_stride < 1:
             raise ValueError("drain_stride must be at least 1")
         default_parameter_values(self.parameters)
+        _validate_metric_specs(self.metrics)
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,6 +726,7 @@ class LiveAnalysisUiConfig:
     channels: Mapping[str, str]
     plots: tuple[PlotSpec, ...]
     parameters: tuple[ParameterSpec, ...] = ()
+    metrics: tuple[MetricSpec, ...] = ()
     plot_rate_hz: float = 30.0
     source_label: str | None = None
     theme: Literal["light", "dark"] = "light"
@@ -678,6 +742,7 @@ class LiveAnalysisUiConfig:
         if self.plot_rate_hz <= 0.0:
             raise ValueError("plot_rate_hz must be greater than 0")
         default_parameter_values(self.parameters)
+        _validate_metric_specs(self.metrics)
         object.__setattr__(self, "channels", dict(self.channels))
 
 
@@ -688,6 +753,7 @@ def live_analysis_ui_config(config: LiveAnalysisApp) -> LiveAnalysisUiConfig:
         channels=config.source.channels,
         plots=config.plots,
         parameters=config.parameters,
+        metrics=config.metrics,
         plot_rate_hz=config.plot_rate_hz,
         source_label=config.source_label,
         theme=config.theme,
@@ -1638,6 +1704,8 @@ def _run_live_analysis_gui(
         _update_live_analysis_control(memory.control, update)
 
     for parameter in config.parameters:
+        if parameter.section is not None:
+            continue
         controls.addWidget(QtWidgets.QLabel(parameter.label))
         widget = _build_parameter_widget(
             parameter,
@@ -1656,13 +1724,33 @@ def _run_live_analysis_gui(
     signal_status.setAlignment(qt_alignment.AlignLeft)
     signal_status.setWordWrap(True)
     signal_status.setStyleSheet(f"color: {selected_theme.muted_color};")
-    root.addWidget(signal_status)
 
-    plot_grid = QtWidgets.QGridLayout()
-    plot_grid.setContentsMargins(0, 0, 0, 0)
-    plot_grid.setHorizontalSpacing(8)
-    plot_grid.setVerticalSpacing(8)
-    root.addLayout(plot_grid, stretch=1)
+    uses_sections = any(plot.section is not None for plot in config.plots)
+    uses_tabs = not uses_sections and any(plot.tab is not None for plot in config.plots)
+    tab_widget: Any | None = None
+    plot_grid: Any | None = None
+    if uses_sections:
+        plot_grid = QtWidgets.QGridLayout()
+        plot_grid.setContentsMargins(0, 0, 0, 0)
+        plot_grid.setHorizontalSpacing(8)
+        plot_grid.setVerticalSpacing(8)
+        plot_grid.setColumnMinimumWidth(0, _SECTION_SIDEBAR_WIDTH)
+        plot_grid.setColumnStretch(0, 0)
+        plot_grid.setColumnStretch(1, 1)
+        plot_grid.setColumnStretch(2, 1)
+        root.addLayout(plot_grid, stretch=1)
+    elif uses_tabs:
+        tab_widget = QtWidgets.QTabWidget()
+        root.addWidget(tab_widget, stretch=1)
+    else:
+        plot_grid = QtWidgets.QGridLayout()
+        plot_grid.setContentsMargins(0, 0, 0, 0)
+        plot_grid.setHorizontalSpacing(8)
+        plot_grid.setVerticalSpacing(8)
+        root.addLayout(plot_grid, stretch=1)
+
+    if not uses_sections:
+        root.addWidget(signal_status)
 
     debug_header = QtWidgets.QHBoxLayout()
     debug_header.setContentsMargins(0, 0, 0, 0)
@@ -1688,11 +1776,124 @@ def _run_live_analysis_gui(
     debug_status.setStyleSheet(f"color: {selected_theme.muted_color};")
     root.addWidget(debug_status)
 
-    plot_items: list[Any] = []
-    plot_curves: list[dict[str, Any]] = []
+    plot_items: list[Any] = [None] * len(config.plots)
+    plot_curves: list[dict[str, Any]] = [{} for _ in config.plots]
     plot_has_seen_data = [False] * len(config.plots)
+    metric_widgets: dict[str, Any] = {}
     color_cycle = cycle(selected_theme.line_colors)
-    for plot_index, plot_spec in enumerate(config.plots):
+
+    def add_sidebar_controls(
+        layout: Any,
+        *,
+        section: str,
+        group: str | None,
+    ) -> None:
+        section_metrics = [
+            metric
+            for metric in config.metrics
+            if metric.section == section and metric.group == group
+        ]
+        for metric in section_metrics:
+            metric_row = QtWidgets.QHBoxLayout()
+            metric_row.setContentsMargins(0, 0, 0, 0)
+            metric_row.setSpacing(6)
+            metric_name = QtWidgets.QLabel(metric.label)
+            metric_value = QtWidgets.QLabel("n/a")
+            metric_value.setAlignment(qt_alignment.AlignRight)
+            metric_value.setStyleSheet(f"color: {selected_theme.muted_color};")
+            metric_widgets[metric.name] = metric_value
+            metric_row.addWidget(metric_name)
+            metric_row.addWidget(metric_value, stretch=1)
+            layout.addLayout(metric_row)
+
+        section_parameters = [
+            parameter
+            for parameter in config.parameters
+            if parameter.section == section and parameter.group == group
+        ]
+        if section_parameters:
+            parameter_grid = QtWidgets.QGridLayout()
+            parameter_grid.setContentsMargins(0, 0, 0, 0)
+            parameter_grid.setHorizontalSpacing(6)
+            parameter_grid.setVerticalSpacing(4)
+            for row, parameter in enumerate(section_parameters):
+                parameter_grid.addWidget(QtWidgets.QLabel(parameter.label), row, 0)
+                widget = _build_parameter_widget(
+                    parameter,
+                    parameter_values,
+                    QtWidgets=QtWidgets,
+                    on_change=set_parameter,
+                )
+                parameter_widgets[parameter.name] = widget
+                parameter_grid.addWidget(widget, row, 1)
+            layout.addLayout(parameter_grid)
+
+    def build_section_sidebar(section: str, group: str | None = None) -> Any:
+        panel = QtWidgets.QWidget()
+        panel.setFixedWidth(_SECTION_SIDEBAR_WIDTH)
+        panel_layout = QtWidgets.QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 8, 0)
+        panel_layout.setSpacing(8)
+
+        title = QtWidgets.QLabel(section.title())
+        title.setStyleSheet(f"color: {selected_theme.text_color}; font-weight: 700;")
+        panel_layout.addWidget(title)
+
+        if group is not None:
+            add_sidebar_controls(panel_layout, section=section, group=group)
+            panel_layout.addStretch(1)
+            return panel
+
+        group_names: list[str] = []
+        for metric in config.metrics:
+            if (
+                metric.section == section
+                and metric.group is not None
+                and metric.group not in group_names
+            ):
+                group_names.append(metric.group)
+        for parameter in config.parameters:
+            if (
+                parameter.section == section
+                and parameter.group is not None
+                and parameter.group not in group_names
+            ):
+                group_names.append(parameter.group)
+
+        if group_names:
+            sidebar_tabs = QtWidgets.QTabWidget()
+            for group_name in group_names:
+                page = QtWidgets.QWidget()
+                page_layout = QtWidgets.QVBoxLayout(page)
+                page_layout.setContentsMargins(0, 8, 0, 0)
+                page_layout.setSpacing(8)
+                add_sidebar_controls(page_layout, section=section, group=group_name)
+                page_layout.addStretch(1)
+                sidebar_tabs.addTab(page, group_name)
+            panel_layout.addWidget(sidebar_tabs, stretch=1)
+
+            ungrouped = any(
+                metric.section == section and metric.group is None
+                for metric in config.metrics
+            ) or any(
+                parameter.section == section and parameter.group is None
+                for parameter in config.parameters
+            )
+            if ungrouped:
+                add_sidebar_controls(panel_layout, section=section, group=None)
+        else:
+            add_sidebar_controls(panel_layout, section=section, group=None)
+            panel_layout.addStretch(1)
+
+        return panel
+
+    def add_plot_widget(
+        plot_index: int,
+        plot_spec: PlotSpec,
+        layout: Any,
+        row: int,
+        column: int,
+    ) -> None:
         widget = pg.PlotWidget(
             title=plot_spec.title,
             viewBox=_PlotViewBox(
@@ -1702,7 +1903,7 @@ def _run_live_analysis_gui(
         )
         widget.setMinimumSize(0, 0)
         widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
-        plot_grid.addWidget(widget, plot_index // 2, plot_index % 2)
+        layout.addWidget(widget, row, column)
         plot_item = widget.getPlotItem()
         plot_item.showGrid(x=True, y=True, alpha=selected_theme.grid_alpha)
         plot_item.setLabel("bottom", plot_spec.x_label, units=plot_spec.x_unit)
@@ -1728,8 +1929,110 @@ def _run_live_analysis_gui(
             plot_item.addItem(curve)
             curves[trace.series] = curve
 
-        plot_items.append(plot_item)
-        plot_curves.append(curves)
+        plot_items[plot_index] = plot_item
+        plot_curves[plot_index] = curves
+
+    if uses_sections:
+        assert plot_grid is not None
+        section_names: list[str] = []
+        plots_by_section: dict[str, list[tuple[int, PlotSpec]]] = {}
+        for plot_index, plot_spec in enumerate(config.plots):
+            section_name = plot_spec.section or "plots"
+            if section_name not in plots_by_section:
+                section_names.append(section_name)
+                plots_by_section[section_name] = []
+            plots_by_section[section_name].append((plot_index, plot_spec))
+
+        for row, section_name in enumerate(section_names):
+            section_plots = plots_by_section[section_name]
+            group_names: list[str] = []
+            plots_by_group: dict[str, list[tuple[int, PlotSpec]]] = {}
+            for plot_index, plot_spec in section_plots:
+                if plot_spec.group is None:
+                    continue
+                if plot_spec.group not in plots_by_group:
+                    group_names.append(plot_spec.group)
+                    plots_by_group[plot_spec.group] = []
+                plots_by_group[plot_spec.group].append((plot_index, plot_spec))
+
+            if group_names:
+                section_tabs = QtWidgets.QTabWidget()
+                plot_grid.addWidget(section_tabs, row, 0, 1, 3)
+                for group_name in group_names:
+                    page = QtWidgets.QWidget()
+                    page_grid = QtWidgets.QGridLayout(page)
+                    page_grid.setContentsMargins(0, 0, 0, 0)
+                    page_grid.setHorizontalSpacing(8)
+                    page_grid.setVerticalSpacing(8)
+                    page_grid.setColumnMinimumWidth(0, _SECTION_SIDEBAR_WIDTH)
+                    page_grid.setColumnStretch(0, 0)
+                    page_grid.setColumnStretch(1, 1)
+                    page_grid.setColumnStretch(2, 1)
+                    page_grid.addWidget(
+                        build_section_sidebar(section_name, group_name),
+                        0,
+                        0,
+                    )
+                    for column_offset, (plot_index, plot_spec) in enumerate(
+                        plots_by_group[group_name][:2]
+                    ):
+                        add_plot_widget(
+                            plot_index,
+                            plot_spec,
+                            page_grid,
+                            0,
+                            column_offset + 1,
+                        )
+                    section_tabs.addTab(page, group_name)
+                continue
+
+            plot_grid.addWidget(build_section_sidebar(section_name), row, 0)
+            for column_offset, (plot_index, plot_spec) in enumerate(section_plots[:2]):
+                add_plot_widget(
+                    plot_index,
+                    plot_spec,
+                    plot_grid,
+                    row,
+                    column_offset + 1,
+                )
+    elif uses_tabs:
+        assert tab_widget is not None
+        tab_names: list[str] = []
+        plots_by_tab: dict[str, list[tuple[int, PlotSpec]]] = {}
+        for plot_index, plot_spec in enumerate(config.plots):
+            tab_name = plot_spec.tab or "Plots"
+            if tab_name not in plots_by_tab:
+                tab_names.append(tab_name)
+                plots_by_tab[tab_name] = []
+            plots_by_tab[tab_name].append((plot_index, plot_spec))
+
+        for tab_name in tab_names:
+            page = QtWidgets.QWidget()
+            tab_grid = QtWidgets.QGridLayout(page)
+            tab_grid.setContentsMargins(0, 0, 0, 0)
+            tab_grid.setHorizontalSpacing(8)
+            tab_grid.setVerticalSpacing(8)
+            tab_widget.addTab(page, tab_name)
+            for row_index, (plot_index, plot_spec) in enumerate(
+                plots_by_tab[tab_name]
+            ):
+                add_plot_widget(
+                    plot_index,
+                    plot_spec,
+                    tab_grid,
+                    row_index // 2,
+                    row_index % 2,
+                )
+    else:
+        assert plot_grid is not None
+        for plot_index, plot_spec in enumerate(config.plots):
+            add_plot_widget(
+                plot_index,
+                plot_spec,
+                plot_grid,
+                plot_index // 2,
+                plot_index % 2,
+            )
 
     poll_rate_display_sma = _VescPollRateDisplaySma()
 
@@ -1795,6 +2098,14 @@ def _run_live_analysis_gui(
                 ):
                     x_min, x_max = _follow_latest_x_range(plot_x_min, plot_x_max)
                     plot_item.setXRange(x_min, x_max, padding=0.0)
+
+            result_metrics = (
+                {}
+                if worker_snapshot.result is None
+                else worker_snapshot.result.metrics
+            )
+            for metric_name, metric_widget in metric_widgets.items():
+                metric_widget.setText(result_metrics.get(metric_name, "n/a"))
 
         signal_status.setText(
             "\n".join(_signal_status_lines(worker_snapshot, config.channels))
@@ -2076,6 +2387,7 @@ __all__ = [
     "FloatArray",
     "LiveAnalysisApp",
     "LiveAnalysisUiConfig",
+    "MetricSpec",
     "ParamValue",
     "ParameterSpec",
     "PlotSpec",

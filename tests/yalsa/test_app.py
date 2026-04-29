@@ -10,6 +10,7 @@ from yalsa import (
     AnalysisResult,
     ChoiceOption,
     LiveAnalysisApp,
+    MetricSpec,
     PlotSpec,
     PlotTrace,
     ScalarSignalSourceAdapter,
@@ -216,6 +217,76 @@ def test_plot_spec_rejects_invalid_x_range() -> None:
             x_label="x",
             y_label="y",
             x_range=(10.0, 0.0),
+        )
+
+
+def test_plot_spec_rejects_empty_tab_name() -> None:
+    with pytest.raises(ValueError, match="tab"):
+        PlotSpec(
+            title="t",
+            tab="",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="x",
+            y_label="y",
+        )
+
+
+def test_plot_spec_rejects_empty_section_name() -> None:
+    with pytest.raises(ValueError, match="section"):
+        PlotSpec(
+            title="t",
+            section="",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="x",
+            y_label="y",
+        )
+
+
+def test_plot_spec_rejects_empty_group_name() -> None:
+    with pytest.raises(ValueError, match="group"):
+        PlotSpec(
+            title="t",
+            group="",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="x",
+            y_label="y",
+        )
+
+
+def test_parameter_spec_rejects_empty_section_name() -> None:
+    with pytest.raises(ValueError, match="section"):
+        float_parameter("cutoff", default=2.0, section="")
+
+
+def test_parameter_spec_rejects_empty_group_name() -> None:
+    with pytest.raises(ValueError, match="group"):
+        float_parameter("cutoff", default=2.0, group="")
+
+
+def test_metric_spec_rejects_empty_group_name() -> None:
+    with pytest.raises(ValueError, match="group"):
+        MetricSpec(name="rms", label="RMS", section="accel", group="")
+
+
+def test_live_analysis_app_rejects_duplicate_metric_names() -> None:
+    source = _FiniteBatchSource([])
+    base = _single_plot_app(
+        source,
+        lambda d, _p: AnalysisResult(
+            series={"raw": xy_series(d.timestamps_s, d.channel("acc_z"))},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="duplicate metric name"):
+        LiveAnalysisApp(
+            title=base.title,
+            source=base.source,
+            plots=base.plots,
+            process=base.process,
+            metrics=(
+                MetricSpec(name="rms", label="RMS", section="accel"),
+                MetricSpec(name="rms", label="RMS", section="gyro"),
+            ),
         )
 
 
@@ -466,6 +537,10 @@ def test_live_analysis_ui_config_excludes_script_runtime_objects() -> None:
     assert ui_config.plots[0].mouse_mode == "pan"
     assert ui_config.plots[0].x_axis_mode == "auto"
     assert ui_config.plots[0].allow_left_drag is True
+    assert ui_config.plots[0].tab is None
+    assert ui_config.plots[0].section is None
+    assert ui_config.plots[0].group is None
+    assert ui_config.metrics == ()
     assert not hasattr(ui_config, "source")
     assert not hasattr(ui_config, "process")
 
