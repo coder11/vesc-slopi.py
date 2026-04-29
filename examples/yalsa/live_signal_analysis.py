@@ -82,6 +82,8 @@ DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
+# Default vertical span for acceleration time-domain plots (units: g).
+DEFAULT_ACCEL_TIME_Y_RANGE: tuple[float, float] = (-1.2, 1.2)
 RAW_TRACE_COLOR = "#afafaf"
 FILTERED_TRACE_COLOR = "#1f77b4"
 SOURCE_CHOICES = (
@@ -832,6 +834,11 @@ def build_dual_axis_analysis_processor(
     return process
 
 
+def _accel_time_plot_y_range(axis: str) -> tuple[float, float] | None:
+    """Fixed Y span for accel time plots; gyro / other axes use auto scaling from data."""
+    return DEFAULT_ACCEL_TIME_Y_RANGE if axis.startswith("acc_") else None
+
+
 def build_analysis(
     *,
     source: SignalBatchSource,
@@ -863,6 +870,7 @@ def build_analysis(
                 max_points=DEFAULT_MAX_POINTS,
                 auto_range_x=True,
                 auto_range_y=False,
+                y_range=_accel_time_plot_y_range(axis),
                 allow_mouse_x=False,
                 allow_mouse_y=True,
                 mouse_mode="rect",
@@ -916,6 +924,7 @@ def build_analysis(
                 max_points=DEFAULT_MAX_POINTS,
                 auto_range_x=True,
                 auto_range_y=False,
+                y_range=DEFAULT_ACCEL_TIME_Y_RANGE,
                 allow_mouse_x=False,
                 allow_mouse_y=True,
                 mouse_mode="rect",

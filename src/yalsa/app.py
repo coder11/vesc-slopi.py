@@ -564,6 +564,8 @@ class PlotSpec:
     mouse_mode: Literal["pan", "rect"] = "pan"
     x_axis_mode: Literal["auto", "follow_latest"] = "auto"
     allow_left_drag: bool = True
+    # If set, Y limits are applied after any initial autoRange (e.g. ±1.2 g for accel time plots).
+    y_range: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         if not self.traces:
@@ -574,6 +576,10 @@ class PlotSpec:
             raise ValueError("mouse_mode must be 'pan' or 'rect'")
         if self.x_axis_mode not in ("auto", "follow_latest"):
             raise ValueError("x_axis_mode must be 'auto' or 'follow_latest'")
+        if self.y_range is not None:
+            y_min, y_max = self.y_range
+            if y_min >= y_max:
+                raise ValueError("y_range must be (min, max) with min < max")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1520,9 +1526,18 @@ def _run_live_analysis_gui(
     qt_mouse_button = getattr(QtCore.Qt, "MouseButton", QtCore.Qt)
 
     class _PlotViewBox(pg.ViewBox):
-        def __init__(self, *, allow_left_drag: bool) -> None:
+        def __init__(
+            self,
+            *,
+            allow_left_drag: bool,
+            wheel_y_pivot: float | None,
+        ) -> None:
             super().__init__()
             self._allow_left_drag = allow_left_drag
+            # When set (typically ``0.0``), wheel zoom scales the Y axis about this
+            # data Y value instead of the cursor. ``None`` keeps pyqtgraph behavior
+            # (including for ``log_y`` plots where a linear zero pivot is invalid).
+            self._wheel_y_pivot = wheel_y_pivot
 
         def mouseDragEvent(self, ev: Any, axis: int | None = None) -> None:
             if (
@@ -1537,6 +1552,37 @@ def _run_live_analysis_gui(
                 ev.ignore()
                 return
             super().mouseDragEvent(ev, axis=axis)
+
+        def wheelEvent(self, ev: Any, axis: int | None = None) -> None:
+            if axis in (0, 1):
+                mask = [False, False]
+                mask[axis] = self.state["mouseEnabled"][axis]
+            else:
+                mask = self.state["mouseEnabled"][:]
+
+            if not any(mask):
+                ev.ignore()
+                return
+
+            scale_factor = 1.02 ** (
+                ev.delta() * self.state["wheelScaleFactor"]
+            )
+            scales = [(None if axis_enabled is False else scale_factor) for axis_enabled in mask]
+            center_point = pg.Point(
+                pg.functions.invertQTransform(
+                    self.childGroup.transform()
+                ).map(ev.pos())
+            )
+            if (
+                self._wheel_y_pivot is not None
+                and scales[1] is not None
+            ):
+                center_point = pg.Point(center_point.x(), self._wheel_y_pivot)
+
+            self._resetTarget()
+            self.scaleBy(scales, center_point)
+            ev.accept()
+            self.sigRangeChangedManually.emit(mask)
 
     root = QtWidgets.QVBoxLayout(window)
     root.setContentsMargins(8, 8, 8, 8)
@@ -1639,7 +1685,10 @@ def _run_live_analysis_gui(
     for plot_index, plot_spec in enumerate(config.plots):
         widget = pg.PlotWidget(
             title=plot_spec.title,
-            viewBox=_PlotViewBox(allow_left_drag=plot_spec.allow_left_drag),
+            viewBox=_PlotViewBox(
+                allow_left_drag=plot_spec.allow_left_drag,
+                wheel_y_pivot=None if plot_spec.log_y else 0.0,
+            ),
         )
         widget.setMinimumSize(0, 0)
         widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
@@ -1721,6 +1770,9 @@ def _run_live_analysis_gui(
                     plot_has_seen_data[plot_index] = True
                     if not plot_spec.auto_range_x or not plot_spec.auto_range_y:
                         plot_item.autoRange()
+                    if plot_spec.y_range is not None:
+                        y_min, y_max = plot_spec.y_range
+                        plot_item.setYRange(y_min, y_max, padding=0.0)
                 if (
                     plot_spec.x_axis_mode == "follow_latest"
                     and plot_x_min is not None

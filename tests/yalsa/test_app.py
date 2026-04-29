@@ -197,6 +197,17 @@ def test_xy_series_rejects_length_mismatch() -> None:
         xy_series(np.array([0.0], dtype=np.float64), np.array([], dtype=np.float64))
 
 
+def test_plot_spec_rejects_invalid_y_range() -> None:
+    with pytest.raises(ValueError, match="y_range"):
+        PlotSpec(
+            title="t",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="x",
+            y_label="y",
+            y_range=(1.0, -1.0),
+        )
+
+
 def test_plot_spec_rejects_invalid_mouse_mode() -> None:
     with pytest.raises(ValueError, match="mouse_mode must be 'pan' or 'rect'"):
         PlotSpec(
