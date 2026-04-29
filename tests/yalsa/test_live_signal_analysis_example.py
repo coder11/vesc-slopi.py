@@ -277,6 +277,163 @@ def test_build_multi_axis_analysis_processor_uses_independent_filters() -> None:
     assert "gyro_z: lowpass, cutoff 40.00 Hz, order 4" in result.status_text
 
 
+def test_build_multi_axis_analysis_processor_adds_mahony_rpy_series() -> None:
+    processor = build_multi_axis_analysis_processor(
+        ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"),
+        {
+            "acc_x": "g",
+            "acc_y": "g",
+            "acc_z": "g",
+            "gyro_x": "deg/s",
+            "gyro_y": "deg/s",
+            "gyro_z": "deg/s",
+        },
+    )
+    timestamps = np.arange(100, dtype=np.float64) / 100.0
+    zeros = np.zeros_like(timestamps)
+    ones = np.ones_like(timestamps)
+    analysis_input = AnalysisInput(
+        batch=SignalBatch(
+            timestamps_s=timestamps,
+            values={
+                "acc_x": zeros,
+                "acc_y": zeros,
+                "acc_z": ones,
+                "gyro_x": zeros,
+                "gyro_y": zeros,
+                "gyro_z": zeros,
+            },
+            units={
+                "acc_x": "g",
+                "acc_y": "g",
+                "acc_z": "g",
+                "gyro_x": "deg/s",
+                "gyro_y": "deg/s",
+                "gyro_z": "deg/s",
+            },
+        ),
+        sample_rate_hz=100.0,
+        source_stats=SignalBatchSourceStats(
+            samples=100,
+            dropped=0,
+            errors=0,
+            average_rate_hz=100.0,
+            latest_sample_s=float(timestamps[-1]),
+            latest_values={},
+            last_error=None,
+            done=False,
+        ),
+    )
+    params = {
+        f"{axis}_{suffix}": value
+        for axis in ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
+        for suffix, value in (
+            ("filter_type", "none"),
+            ("cutoff_hz", 10.0),
+            ("filter_order", 2),
+        )
+    }
+    params["spectrum_mode"] = "psd"
+
+    result = processor(analysis_input, params)
+
+    assert result.series["mahony_roll"].x.size == timestamps.size
+    assert result.series["mahony_pitch"].x.size == timestamps.size
+    assert result.series["mahony_yaw"].x.size == timestamps.size
+    np.testing.assert_allclose(result.series["mahony_roll"].y, 0.0)
+    np.testing.assert_allclose(result.series["mahony_pitch"].y, 0.0)
+    np.testing.assert_allclose(result.series["mahony_yaw"].y, 0.0)
+
+
+def test_build_multi_axis_analysis_processor_feeds_filtered_data_to_mahony(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    processor = build_multi_axis_analysis_processor(
+        ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z"),
+        {
+            "acc_x": "g",
+            "acc_y": "g",
+            "acc_z": "g",
+            "gyro_x": "deg/s",
+            "gyro_y": "deg/s",
+            "gyro_z": "deg/s",
+        },
+    )
+    timestamps = np.arange(400, dtype=np.float64) / 200.0
+    acc_x = np.sin(2.0 * np.pi * 25.0 * timestamps)
+    zeros = np.zeros_like(timestamps)
+    ones = np.ones_like(timestamps)
+    captured: dict[str, np.ndarray] = {}
+
+    def fake_mahony_roll_pitch_yaw_deg(
+        timestamps: np.ndarray,
+        *,
+        acc_x: np.ndarray,
+        acc_y: np.ndarray,
+        acc_z: np.ndarray,
+        gyro_x: np.ndarray,
+        gyro_y: np.ndarray,
+        gyro_z: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        del acc_y, acc_z, gyro_x, gyro_y, gyro_z
+        captured["acc_x"] = acc_x
+        empty = np.zeros_like(timestamps)
+        return empty, empty, empty
+
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "_mahony_roll_pitch_yaw_deg",
+        fake_mahony_roll_pitch_yaw_deg,
+    )
+    analysis_input = AnalysisInput(
+        batch=SignalBatch(
+            timestamps_s=timestamps,
+            values={
+                "acc_x": acc_x,
+                "acc_y": zeros,
+                "acc_z": ones,
+                "gyro_x": zeros,
+                "gyro_y": zeros,
+                "gyro_z": zeros,
+            },
+            units={
+                "acc_x": "g",
+                "acc_y": "g",
+                "acc_z": "g",
+                "gyro_x": "deg/s",
+                "gyro_y": "deg/s",
+                "gyro_z": "deg/s",
+            },
+        ),
+        sample_rate_hz=200.0,
+        source_stats=SignalBatchSourceStats(
+            samples=400,
+            dropped=0,
+            errors=0,
+            average_rate_hz=200.0,
+            latest_sample_s=float(timestamps[-1]),
+            latest_values={},
+            last_error=None,
+            done=False,
+        ),
+    )
+    params = {
+        f"{axis}_{suffix}": value
+        for axis in ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
+        for suffix, value in (
+            ("filter_type", "lowpass"),
+            ("cutoff_hz", 5.0),
+            ("filter_order", 2),
+        )
+    }
+    params["spectrum_mode"] = "psd"
+
+    result = processor(analysis_input, params)
+
+    assert captured["acc_x"] is result.series["acc_x_filtered"].y
+    assert captured["acc_x"] is not acc_x
+
+
 def test_build_analysis_exposes_live_tunable_parameters() -> None:
     config = LiveSignalAnalysisConfig(
         source="deterministic",
@@ -309,7 +466,7 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
         "spectrum_mode",
     ]
     assert app.theme == "light"
-    assert len(app.plots) == 12
+    assert len(app.plots) == 18
     assert [plot.section for plot in app.plots] == [
         "accel",
         "accel",
@@ -317,6 +474,12 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
         "accel",
         "accel",
         "accel",
+        "accel",
+        "accel",
+        "accel",
+        "gyro",
+        "gyro",
+        "gyro",
         "gyro",
         "gyro",
         "gyro",
@@ -327,22 +490,28 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
     assert [plot.group for plot in app.plots] == [
         "X",
         "X",
+        "X",
+        "Y",
         "Y",
         "Y",
         "Z",
         "Z",
+        "Z",
+        "X",
         "X",
         "X",
         "Y",
         "Y",
+        "Y",
+        "Z",
         "Z",
         "Z",
     ]
     assert [plot.title for plot in app.plots[:4]] == [
         "Accel X Time Series",
         "Accel X Frequency",
+        "Mahony RPY",
         "Accel Y Time Series",
-        "Accel Y Frequency",
     ]
     assert [metric.name for metric in app.metrics] == [
         "acc_x_rms",

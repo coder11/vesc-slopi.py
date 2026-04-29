@@ -16,6 +16,7 @@ import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from math import asin, atan2, pi, sqrt
 from typing import Literal, cast
 
 import numpy as np
@@ -101,6 +102,11 @@ AXIS_TRACE_COLORS = {
     "y": ("#9bd39b", "#2ca02c"),
     "z": ("#9db7e8", "#1f77b4"),
 }
+RPY_TRACE_COLORS = {
+    "roll": "#d62728",
+    "pitch": "#2ca02c",
+    "yaw": "#1f77b4",
+}
 SOURCE_CHOICES = (
     DEFAULT_SOURCE,
     "deterministic",
@@ -108,6 +114,11 @@ SOURCE_CHOICES = (
     "deterministic-white-noise",
 )
 DEFAULT_TIMEOUT = 0.1
+MAHONY_ACC_CONFIDENCE_DECAY = 1.0
+MAHONY_KP = 0.3
+MAHONY_KI = 0.0
+RAD_TO_DEG = 180.0 / pi
+DEG_TO_RAD = pi / 180.0
 
 # Edit these values directly instead of passing example-specific CLI flags.
 RUN_SOURCE = DEFAULT_SOURCE
@@ -176,6 +187,162 @@ def empty_series() -> tuple[np.ndarray, np.ndarray]:
     """Return a shared empty x/y pair."""
     empty = np.empty(0, dtype=np.float64)
     return empty, empty
+
+
+@dataclass(slots=True)
+class MahonyAttitude:
+    """Minimal state for the VESC Mahony IMU update port."""
+
+    q0: float = 1.0
+    q1: float = 0.0
+    q2: float = 0.0
+    q3: float = 0.0
+    integral_fbx: float = 0.0
+    integral_fby: float = 0.0
+    integral_fbz: float = 0.0
+    acc_mag_p: float = 1.0
+
+
+def _truncate(value: float, minimum: float, maximum: float) -> float:
+    return min(max(value, minimum), maximum)
+
+
+def _calculate_acc_confidence(attitude: MahonyAttitude, acc_mag: float) -> float:
+    acc_mag = attitude.acc_mag_p * 0.9 + acc_mag * 0.1
+    attitude.acc_mag_p = acc_mag
+    confidence = 1.0 - (
+        MAHONY_ACC_CONFIDENCE_DECAY * sqrt(abs(acc_mag - 1.0))
+    )
+    return _truncate(confidence, 0.0, 1.0)
+
+
+def _update_mahony_imu(
+    attitude: MahonyAttitude,
+    *,
+    gyro_xyz: tuple[float, float, float],
+    accel_xyz: tuple[float, float, float],
+    dt: float,
+) -> None:
+    """Port of ``ahrs_update_mahony_imu`` from the VESC firmware."""
+    gx, gy, gz = gyro_xyz
+    ax, ay, az = accel_xyz
+
+    accel_norm = sqrt(ax * ax + ay * ay + az * az)
+    if accel_norm > 0.01:
+        two_kp = 2.0 * MAHONY_KP
+        two_ki = 2.0 * MAHONY_KI
+        accel_confidence = _calculate_acc_confidence(attitude, accel_norm)
+        two_kp *= accel_confidence
+        two_ki *= accel_confidence
+
+        recip_norm = 1.0 / accel_norm
+        ax *= recip_norm
+        ay *= recip_norm
+        az *= recip_norm
+
+        half_vx = attitude.q1 * attitude.q3 - attitude.q0 * attitude.q2
+        half_vy = attitude.q0 * attitude.q1 + attitude.q2 * attitude.q3
+        half_vz = attitude.q0 * attitude.q0 - 0.5 + attitude.q3 * attitude.q3
+
+        half_ex = ay * half_vz - az * half_vy
+        half_ey = az * half_vx - ax * half_vz
+        half_ez = ax * half_vy - ay * half_vx
+
+        if two_ki > 0.0:
+            attitude.integral_fbx += two_ki * half_ex * dt
+            attitude.integral_fby += two_ki * half_ey * dt
+            attitude.integral_fbz += two_ki * half_ez * dt
+            gx += attitude.integral_fbx
+            gy += attitude.integral_fby
+            gz += attitude.integral_fbz
+        else:
+            attitude.integral_fbx = 0.0
+            attitude.integral_fby = 0.0
+            attitude.integral_fbz = 0.0
+
+        gx += two_kp * half_ex
+        gy += two_kp * half_ey
+        gz += two_kp * half_ez
+
+    gx *= 0.5 * dt
+    gy *= 0.5 * dt
+    gz *= 0.5 * dt
+
+    qa = attitude.q0
+    qb = attitude.q1
+    qc = attitude.q2
+    attitude.q0 += -qb * gx - qc * gy - attitude.q3 * gz
+    attitude.q1 += qa * gx + qc * gz - attitude.q3 * gy
+    attitude.q2 += qa * gy - qb * gz + attitude.q3 * gx
+    attitude.q3 += qa * gz + qb * gy - qc * gx
+
+    recip_norm = 1.0 / sqrt(
+        attitude.q0 * attitude.q0
+        + attitude.q1 * attitude.q1
+        + attitude.q2 * attitude.q2
+        + attitude.q3 * attitude.q3
+    )
+    attitude.q0 *= recip_norm
+    attitude.q1 *= recip_norm
+    attitude.q2 *= recip_norm
+    attitude.q3 *= recip_norm
+
+
+def _mahony_roll_pitch_yaw_deg(
+    timestamps: np.ndarray,
+    *,
+    acc_x: np.ndarray,
+    acc_y: np.ndarray,
+    acc_z: np.ndarray,
+    gyro_x: np.ndarray,
+    gyro_y: np.ndarray,
+    gyro_z: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return roll, pitch, yaw from raw accel/gyro using hardcoded Mahony params."""
+    sample_count = int(timestamps.size)
+    roll = np.empty(sample_count, dtype=np.float64)
+    pitch = np.empty(sample_count, dtype=np.float64)
+    yaw = np.empty(sample_count, dtype=np.float64)
+    attitude = MahonyAttitude()
+    previous_t = float(timestamps[0]) if sample_count else 0.0
+
+    for index in range(sample_count):
+        current_t = float(timestamps[index])
+        dt = max(0.0, current_t - previous_t) if index > 0 else 0.0
+        previous_t = current_t
+        _update_mahony_imu(
+            attitude,
+            gyro_xyz=(
+                float(gyro_x[index]) * DEG_TO_RAD,
+                float(gyro_y[index]) * DEG_TO_RAD,
+                float(gyro_z[index]) * DEG_TO_RAD,
+            ),
+            accel_xyz=(
+                float(acc_x[index]),
+                float(acc_y[index]),
+                float(acc_z[index]),
+            ),
+            dt=dt,
+        )
+
+        q0 = attitude.q0
+        q1 = attitude.q1
+        q2 = attitude.q2
+        q3 = attitude.q3
+        roll[index] = (
+            -atan2(q0 * q1 + q2 * q3, 0.5 - (q1 * q1 + q2 * q2))
+            * RAD_TO_DEG
+        )
+        pitch[index] = (
+            asin(_truncate(-2.0 * (q1 * q3 - q0 * q2), -1.0, 1.0))
+            * RAD_TO_DEG
+        )
+        yaw[index] = (
+            -atan2(q0 * q3 + q1 * q2, 0.5 - (q2 * q2 + q3 * q3))
+            * RAD_TO_DEG
+        )
+
+    return roll, pitch, yaw
 
 
 class PendingSignalBatchBuffer:
@@ -925,6 +1092,67 @@ def _axis_plot_traces(axis: str, suffix: str) -> tuple[PlotTrace, ...]:
     )
 
 
+def _rpy_plot_traces() -> tuple[PlotTrace, ...]:
+    return (
+        PlotTrace(
+            series="mahony_roll",
+            label="Roll",
+            color=RPY_TRACE_COLORS["roll"],
+            width=1.5,
+        ),
+        PlotTrace(
+            series="mahony_pitch",
+            label="Pitch",
+            color=RPY_TRACE_COLORS["pitch"],
+            width=1.5,
+        ),
+        PlotTrace(
+            series="mahony_yaw",
+            label="Yaw",
+            color=RPY_TRACE_COLORS["yaw"],
+            width=1.5,
+        ),
+    )
+
+
+def _add_empty_rpy_series(series: dict[str, SeriesData]) -> None:
+    empty_x, empty_y = empty_series()
+    series["mahony_roll"] = xy_series(empty_x, empty_y)
+    series["mahony_pitch"] = xy_series(empty_x, empty_y)
+    series["mahony_yaw"] = xy_series(empty_x, empty_y)
+
+
+def _add_mahony_rpy_series(
+    series: dict[str, SeriesData],
+    timestamps: np.ndarray,
+    filtered_by_axis: Mapping[str, np.ndarray],
+) -> None:
+    required_axes = ACCEL_AXES + GYRO_AXES
+    if (
+        int(timestamps.size) == 0
+        or any(axis not in filtered_by_axis for axis in required_axes)
+        or any(
+            int(filtered_by_axis[axis].size) != int(timestamps.size)
+            for axis in required_axes
+        )
+    ):
+        _add_empty_rpy_series(series)
+        return
+
+    roll, pitch, yaw = _mahony_roll_pitch_yaw_deg(
+        timestamps,
+        acc_x=filtered_by_axis["acc_x"],
+        acc_y=filtered_by_axis["acc_y"],
+        acc_z=filtered_by_axis["acc_z"],
+        gyro_x=filtered_by_axis["gyro_x"],
+        gyro_y=filtered_by_axis["gyro_y"],
+        gyro_z=filtered_by_axis["gyro_z"],
+    )
+    series["mahony_roll"] = xy_series(timestamps, roll)
+    series["mahony_pitch"] = xy_series(timestamps, pitch)
+    series["mahony_yaw"] = xy_series(timestamps, yaw)
+
+
 def build_multi_axis_analysis_processor(
     axes: Sequence[str],
     units: Mapping[str, str],
@@ -940,6 +1168,7 @@ def build_multi_axis_analysis_processor(
         sample_rate_hz = data.sample_rate_hz
         spectrum_mode = cast(str, params["spectrum_mode"])
         series: dict[str, SeriesData] = {}
+        filtered_by_axis: dict[str, np.ndarray] = {}
         metrics: dict[str, str] = {}
         status_parts = [f"mode: {spectrum_mode.upper()}"]
         has_samples = False
@@ -1012,6 +1241,7 @@ def build_multi_axis_analysis_processor(
                 timestamps,
                 filtered,
             )
+            filtered_by_axis[axis] = filtered
             series[_axis_series_name(axis, "raw_spectrum")] = raw_spectrum_series
             series[_axis_series_name(axis, "filtered_spectrum")] = (
                 filtered_spectrum_series
@@ -1048,6 +1278,8 @@ def build_multi_axis_analysis_processor(
                 status_parts.append(
                     f"{axis} filtered RMS: {filtered_stats.rms:.6g} {unit}"
                 )
+
+        _add_mahony_rpy_series(series, timestamps, filtered_by_axis)
 
         if not has_samples:
             return AnalysisResult(series=series, status_text="waiting for samples")
@@ -1119,6 +1351,25 @@ def build_analysis(
                         allow_mouse_x=False,
                         allow_mouse_y=True,
                         mouse_mode="rect",
+                        allow_left_drag=False,
+                    ),
+                    PlotSpec(
+                        title="Mahony RPY",
+                        section=section,
+                        group=group,
+                        traces=_rpy_plot_traces(),
+                        x_label="time",
+                        x_unit="s",
+                        y_label="angle",
+                        y_unit="deg",
+                        max_points=DEFAULT_MAX_POINTS,
+                        auto_range_x=True,
+                        auto_range_y=False,
+                        y_range=(-180.0, 180.0),
+                        allow_mouse_x=False,
+                        allow_mouse_y=True,
+                        mouse_mode="rect",
+                        x_axis_mode="follow_latest",
                         allow_left_drag=False,
                     ),
                 )

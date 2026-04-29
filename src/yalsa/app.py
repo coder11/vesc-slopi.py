@@ -1738,6 +1738,7 @@ def _run_live_analysis_gui(
         plot_grid.setColumnStretch(0, 0)
         plot_grid.setColumnStretch(1, 1)
         plot_grid.setColumnStretch(2, 1)
+        plot_grid.setColumnStretch(3, 1)
         root.addLayout(plot_grid, stretch=1)
     elif uses_tabs:
         tab_widget = QtWidgets.QTabWidget()
@@ -1957,7 +1958,7 @@ def _run_live_analysis_gui(
 
             if group_names:
                 section_tabs = QtWidgets.QTabWidget()
-                plot_grid.addWidget(section_tabs, row, 0, 1, 3)
+                plot_grid.addWidget(section_tabs, row, 0, 1, 4)
                 for group_name in group_names:
                     page = QtWidgets.QWidget()
                     page_grid = QtWidgets.QGridLayout(page)
@@ -1968,13 +1969,14 @@ def _run_live_analysis_gui(
                     page_grid.setColumnStretch(0, 0)
                     page_grid.setColumnStretch(1, 1)
                     page_grid.setColumnStretch(2, 1)
+                    page_grid.setColumnStretch(3, 1)
                     page_grid.addWidget(
                         build_section_sidebar(section_name, group_name),
                         0,
                         0,
                     )
                     for column_offset, (plot_index, plot_spec) in enumerate(
-                        plots_by_group[group_name][:2]
+                        plots_by_group[group_name][:3]
                     ):
                         add_plot_widget(
                             plot_index,
@@ -1987,7 +1989,7 @@ def _run_live_analysis_gui(
                 continue
 
             plot_grid.addWidget(build_section_sidebar(section_name), row, 0)
-            for column_offset, (plot_index, plot_spec) in enumerate(section_plots[:2]):
+            for column_offset, (plot_index, plot_spec) in enumerate(section_plots[:3]):
                 add_plot_widget(
                     plot_index,
                     plot_spec,
