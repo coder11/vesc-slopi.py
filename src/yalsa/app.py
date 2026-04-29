@@ -1118,20 +1118,20 @@ QWidget {{
     background-color: {theme.window_background};
     color: {theme.text_color};
 }}
-QLabel, QCheckBox {{
+QLabel, QCheckBox, QToolButton {{
     color: {theme.text_color};
 }}
-QPushButton, QSpinBox, QDoubleSpinBox, QComboBox {{
+QPushButton, QToolButton, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {theme.control_background};
     border: 1px solid {theme.control_border};
     border-radius: 3px;
     color: {theme.text_color};
     padding: 3px 6px;
 }}
-QPushButton:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
+QPushButton:hover, QToolButton:hover, QSpinBox:hover, QDoubleSpinBox:hover, QComboBox:hover {{
     background-color: {theme.control_hover};
 }}
-QPushButton:pressed {{
+QPushButton:pressed, QToolButton:pressed {{
     background-color: {theme.control_pressed};
 }}
 QComboBox QAbstractItemView {{
@@ -1174,17 +1174,30 @@ def _signal_status_lines(
         lines.append(f"analysis error: {worker_snapshot.process_error}")
     elif worker_snapshot.result is not None:
         lines.extend(_split_status_lines(worker_snapshot.result.status_text))
-    snapshot = worker_snapshot.source_snapshot
-    lines.extend(
-        (
-            f"source: {_format_rate(snapshot.average_rate_hz)}",
-            f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
-            f"samples: {snapshot.samples}",
-            f"dropped: {snapshot.dropped}",
-            f"errors: {snapshot.errors}",
-        )
-    )
     return lines
+
+
+def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
+    snapshot = worker_snapshot.source_snapshot
+    lines = [
+        f"source: {_format_rate(snapshot.average_rate_hz)}",
+        f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
+        f"samples: {snapshot.samples}",
+        f"dropped: {snapshot.dropped}",
+        f"errors: {snapshot.errors}",
+    ]
+    if snapshot.last_error:
+        lines.append(f"source error: {snapshot.last_error}")
+    if worker_snapshot.process_error:
+        lines.append(f"analysis error: {worker_snapshot.process_error}")
+    return lines
+
+
+def _debug_toggle_text(worker_snapshot: _AnalysisWorkerSnapshot | None) -> str:
+    if worker_snapshot is None:
+        return "Source rate: measuring"
+    source_rate = _format_rate(worker_snapshot.source_snapshot.average_rate_hz)
+    return f"Source rate: {source_rate}"
 
 
 def _read_live_analysis_control(slot: _PickleSharedMemorySlot) -> _LiveAnalysisControl:
@@ -1332,6 +1345,7 @@ def _run_live_analysis_gui(
     window.setStyleSheet(_qt_theme_stylesheet(selected_theme))
 
     qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
+    qt_arrow = getattr(QtCore.Qt, "ArrowType", QtCore.Qt)
     qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
 
     root = QtWidgets.QVBoxLayout(window)
@@ -1403,6 +1417,30 @@ def _run_live_analysis_gui(
     plot_grid.setHorizontalSpacing(8)
     plot_grid.setVerticalSpacing(8)
     root.addLayout(plot_grid, stretch=1)
+
+    debug_header = QtWidgets.QHBoxLayout()
+    debug_header.setContentsMargins(0, 0, 0, 0)
+    debug_header.setSpacing(6)
+    root.addLayout(debug_header)
+
+    debug_toggle = QtWidgets.QToolButton()
+    debug_toggle.setCheckable(True)
+    debug_toggle.setChecked(False)
+    debug_toggle.setArrowType(qt_arrow.RightArrow)
+    debug_toggle.setText("Runtime")
+    debug_header.addWidget(debug_toggle)
+
+    debug_summary = QtWidgets.QLabel(_debug_toggle_text(None))
+    debug_summary.setAlignment(qt_alignment.AlignLeft)
+    debug_summary.setStyleSheet(f"color: {selected_theme.muted_color};")
+    debug_header.addWidget(debug_summary, stretch=1)
+
+    debug_status = QtWidgets.QLabel("")
+    debug_status.setAlignment(qt_alignment.AlignLeft)
+    debug_status.setWordWrap(True)
+    debug_status.setVisible(False)
+    debug_status.setStyleSheet(f"color: {selected_theme.muted_color};")
+    root.addWidget(debug_status)
 
     plot_items: list[Any] = []
     plot_curves: list[dict[str, Any]] = []
@@ -1476,6 +1514,8 @@ def _run_live_analysis_gui(
         signal_status.setText(
             "\n".join(_signal_status_lines(worker_snapshot, config.channels))
         )
+        debug_summary.setText(_debug_toggle_text(worker_snapshot))
+        debug_status.setText("\n".join(_debug_status_lines(worker_snapshot)))
 
     def clear_history() -> None:
         nonlocal rendered_state_version
@@ -1509,6 +1549,14 @@ def _run_live_analysis_gui(
             return
 
     clear_button.clicked.connect(clear_history)
+
+    def set_debug_visible(visible: bool) -> None:
+        debug_status.setVisible(visible)
+        debug_toggle.setArrowType(
+            qt_arrow.DownArrow if visible else qt_arrow.RightArrow
+        )
+
+    debug_toggle.toggled.connect(set_debug_visible)
 
     timer = QtCore.QTimer(window)
     interval_ms = max(1, round(1000.0 / config.plot_rate_hz))

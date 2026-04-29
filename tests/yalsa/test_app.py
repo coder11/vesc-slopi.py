@@ -231,12 +231,16 @@ def test_live_analysis_status_lines_include_signal_and_source_data() -> None:
         "mode: PSD",
         "raw RMS: 0.5 g",
         "filtered RMS: 0.4 g",
+    ]
+    assert yalsa_app._debug_status_lines(worker_snapshot) == [
         "source: 123.0 Hz",
         "history: 120.0 Hz",
         "samples: 10",
         "dropped: 2",
         "errors: 1",
     ]
+    assert yalsa_app._debug_toggle_text(worker_snapshot) == "Source rate: 123.0 Hz"
+    assert yalsa_app._debug_toggle_text(None) == "Source rate: measuring"
 
 
 def test_qt_theme_stylesheet_forces_light_widget_palette() -> None:
@@ -244,7 +248,7 @@ def test_qt_theme_stylesheet_forces_light_widget_palette() -> None:
 
     assert "background-color: #f6f7f9" in stylesheet
     assert "color: #202124" in stylesheet
-    assert "QPushButton, QSpinBox, QDoubleSpinBox, QComboBox" in stylesheet
+    assert "QPushButton, QToolButton, QSpinBox, QDoubleSpinBox, QComboBox" in stylesheet
     assert "border: 1px solid #c7cdd4" in stylesheet
 
 
