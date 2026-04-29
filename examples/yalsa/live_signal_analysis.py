@@ -25,32 +25,32 @@ from vesc_py.fast_imu_source import (
     imu_axis_unit,
     parse_imu_axis,
 )
+from vesc_py.live_signal import (
+    DeterministicSignalSource,
+    DeterministicWhiteNoiseSignalSource,
+    NoisyDeterministicSignalSource,
+    SignalSource,
+)
 from yalsa import (
     AnalysisInput,
     AnalysisResult,
     ChoiceOption,
     LiveAnalysisApp,
     ParamValue,
-    ProcessCallback,
     PlotSpec,
     PlotTrace,
+    ProcessCallback,
     ScalarSignalSourceAdapter,
     SignalBatchSource,
+    butter_lowpass_hz,
     choice_parameter,
+    fft_magnitude,
     float_parameter,
     int_parameter,
-    butter_lowpass_hz,
-    fft_magnitude,
     run_live_analysis,
     signal_stats,
     welch_psd,
     xy_series,
-)
-from vesc_py.live_signal import (
-    DeterministicSignalSource,
-    DeterministicWhiteNoiseSignalSource,
-    NoisyDeterministicSignalSource,
-    SignalSource,
 )
 
 DEFAULT_HISTORY = 20_000
@@ -58,6 +58,8 @@ DEFAULT_MAX_POINTS = 1_200
 DEFAULT_PLOT_RATE = 30.0
 DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
+# DEFAULT_VESC_POLL_RATE = 500.0
+DEFAULT_VESC_POLL_RATE = None
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
@@ -74,12 +76,14 @@ DEFAULT_TIMEOUT = 0.1
 RUN_SOURCE = DEFAULT_SOURCE
 RUN_AXIS = "acc_z"
 RUN_DETERMINISTIC_RATE = DEFAULT_DETERMINISTIC_RATE
+RUN_VESC_POLL_RATE = DEFAULT_VESC_POLL_RATE
 RUN_TIMEOUT = DEFAULT_TIMEOUT
 
 SPECTRUM_OPTIONS = (
     ChoiceOption(value="psd", label="PSD"),
     ChoiceOption(value="fft", label="FFT"),
 )
+
 
 @dataclass(frozen=True, slots=True)
 class LiveSignalAnalysisConfig:
@@ -88,6 +92,7 @@ class LiveSignalAnalysisConfig:
     source: str = DEFAULT_SOURCE
     axis: str = "acc_z"
     deterministic_rate: float = DEFAULT_DETERMINISTIC_RATE
+    vesc_poll_rate: float | None = DEFAULT_VESC_POLL_RATE
     timeout: float = DEFAULT_TIMEOUT
 
     def __post_init__(self) -> None:
@@ -95,6 +100,8 @@ class LiveSignalAnalysisConfig:
             raise ValueError(f"unsupported source {self.source!r}")
         if self.deterministic_rate <= 0.0:
             raise ValueError("deterministic_rate must be greater than 0")
+        if self.vesc_poll_rate is not None and self.vesc_poll_rate <= 0.0:
+            raise ValueError("vesc_poll_rate must be greater than 0")
         if self.timeout <= 0.0:
             raise ValueError("timeout must be greater than 0")
         object.__setattr__(self, "axis", parse_imu_axis(self.axis))
@@ -106,6 +113,7 @@ def build_runtime_config() -> LiveSignalAnalysisConfig:
         source=RUN_SOURCE,
         axis=RUN_AXIS,
         deterministic_rate=RUN_DETERMINISTIC_RATE,
+        vesc_poll_rate=RUN_VESC_POLL_RATE,
         timeout=RUN_TIMEOUT,
     )
 
@@ -193,7 +201,9 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
             f"order: {filter_order}",
         ]
         if cutoff_hz is not None and cutoff_hz != requested_cutoff_hz:
-            status_parts.append(f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz")
+            status_parts.append(
+                f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz"
+            )
         if raw_stats is not None:
             status_parts.append(f"raw RMS: {raw_stats.rms:.6g} {unit}")
         if filtered_stats is not None:
@@ -298,6 +308,7 @@ def make_source(
             axis=axis,
             timeout=config.timeout,
             pending_samples=DEFAULT_PENDING_SAMPLES,
+            poll_rate_hz=config.vesc_poll_rate,
             can_id=vesc_target.can_id,
         )
         target_label = (
@@ -305,11 +316,16 @@ def make_source(
             if vesc_target.can_id is None
             else f"CAN {vesc_target.can_id}"
         )
+        rate_label = (
+            "uncapped"
+            if config.vesc_poll_rate is None
+            else f"<= {config.vesc_poll_rate:g} Hz"
+        )
         return (
             ScalarSignalSourceAdapter(scalar_source),
             (
                 f"VESC IMU axis source: {axis} via {vesc_target.connection.describe()} "
-                f"({target_label})"
+                f"({target_label}; {rate_label})"
             ),
         )
 

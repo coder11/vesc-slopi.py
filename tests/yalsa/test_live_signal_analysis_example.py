@@ -33,6 +33,54 @@ def test_make_source_wraps_deterministic_source() -> None:
     assert source_label == "Deterministic source @ 321 Hz"
 
 
+def test_make_source_passes_vesc_poll_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeVescImuSignalSource:
+        def __init__(self, **kwargs: object) -> None:
+            calls.update(kwargs)
+            self.channel_name = "acc_z"
+            self.unit = "g"
+
+        def start(self) -> None:
+            return None
+
+        def stop(self, timeout: float = 1.0) -> None:
+            return None
+
+        def drain(self) -> tuple[object, object, int]:
+            raise AssertionError("drain should not be called in this test")
+
+        def snapshot(self) -> object:
+            raise AssertionError("snapshot should not be called in this test")
+
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "VescImuSignalSource",
+        FakeVescImuSignalSource,
+    )
+    config = LiveSignalAnalysisConfig(
+        source="vesc",
+        axis="acc_z",
+        vesc_poll_rate=321.0,
+    )
+    target = VescTarget(VescConnection.serial("/dev/ttyACM0"), can_id=7)
+
+    _source, source_label = make_source(config, vesc_target=target)
+
+    assert calls == {
+        "connection": target.connection,
+        "axis": "acc_z",
+        "timeout": pytest.approx(live_signal_analysis.DEFAULT_TIMEOUT),
+        "pending_samples": live_signal_analysis.DEFAULT_PENDING_SAMPLES,
+        "poll_rate_hz": 321.0,
+        "can_id": 7,
+    }
+    assert "<= 321 Hz" in source_label
+
+
 def test_build_axis_analysis_processor_returns_expected_series() -> None:
     processor = build_axis_analysis_processor("acc_z", "g")
     timestamps = np.arange(400, dtype=np.float64) / 200.0
@@ -139,6 +187,7 @@ def test_build_runtime_config_reads_module_level_settings(
     monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "deterministic-noisy")
     monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "gyro_z")
     monkeypatch.setattr(live_signal_analysis, "RUN_DETERMINISTIC_RATE", 321.0)
+    monkeypatch.setattr(live_signal_analysis, "RUN_VESC_POLL_RATE", 123.0)
     monkeypatch.setattr(live_signal_analysis, "RUN_TIMEOUT", 0.25)
 
     assert build_runtime_config() == LiveSignalAnalysisConfig(
@@ -146,6 +195,7 @@ def test_build_runtime_config_reads_module_level_settings(
         axis="gyro_z",
         timeout=0.25,
         deterministic_rate=321.0,
+        vesc_poll_rate=123.0,
     )
 
 
@@ -192,6 +242,7 @@ def test_main_skips_vesc_connection_cli_for_non_vesc_source(
         source="deterministic",
         axis="gyro_z",
         deterministic_rate=321.0,
+        vesc_poll_rate=live_signal_analysis.DEFAULT_VESC_POLL_RATE,
     )
     assert calls["vesc_target"] is None
     assert calls["app"] is fake_app
@@ -234,6 +285,7 @@ def test_main_runs_vesc_connection_cli_for_vesc_source(
     monkeypatch.setattr(live_signal_analysis, "run_live_analysis", fake_run_live_analysis)
     monkeypatch.setattr(live_signal_analysis, "RUN_SOURCE", "vesc")
     monkeypatch.setattr(live_signal_analysis, "RUN_AXIS", "acc_z")
+    monkeypatch.setattr(live_signal_analysis, "RUN_VESC_POLL_RATE", 321.0)
     monkeypatch.setattr(live_signal_analysis, "RUN_TIMEOUT", 0.25)
 
     live_signal_analysis.main(
@@ -247,6 +299,7 @@ def test_main_runs_vesc_connection_cli_for_vesc_source(
     assert calls["config"] == LiveSignalAnalysisConfig(
         source="vesc",
         axis="acc_z",
+        vesc_poll_rate=321.0,
         timeout=0.25,
     )
     assert calls["vesc_target"] == fake_target
