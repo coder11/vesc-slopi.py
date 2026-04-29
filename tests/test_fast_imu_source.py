@@ -189,3 +189,78 @@ def test_vesc_source_run_caps_poll_rate(
     intervals = [later - earlier for earlier, later in zip(write_times, write_times[1:])]
     assert intervals[0] >= 0.045
     assert intervals[1] >= 0.045
+
+
+def test_vesc_source_timestamps_samples_at_request_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_ns = 1_000_000_000
+    request_times_ns: list[int] = []
+    response_latencies_ns = [200_000, 1_400_000, 100_000]
+
+    class FakeSerial:
+        timeout = 0.0
+
+        def write(self, _data: bytes) -> None:
+            request_times_ns.append(clock_ns)
+
+        def read(self, _size: int) -> bytes:
+            return b""
+
+        def reset_input_buffer(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    fake_serial = FakeSerial()
+    source = VescImuSignalSource(
+        connection=VescConnection.serial("/dev/null"),
+        axis="acc_x",
+        timeout=0.1,
+        pending_samples=64,
+        poll_rate_hz=500.0,
+    )
+
+    def fake_open_blocking_io(connection: VescConnection, *, timeout: float) -> FakeSerial:
+        assert connection == VescConnection.serial("/dev/null")
+        assert timeout == pytest.approx(0.1)
+        return fake_serial
+
+    def fake_wait_until_ns(deadline_ns: int, _stop: object) -> bool:
+        nonlocal clock_ns
+        clock_ns = max(clock_ns, deadline_ns)
+        return True
+
+    def fake_read_expected_imu_packet(
+        serial_port: FakeSerial,
+        packet_timeout: float,
+        stats: object,
+    ) -> bytes:
+        nonlocal clock_ns
+        assert serial_port is fake_serial
+        assert packet_timeout == pytest.approx(0.1)
+        assert stats is not None
+        clock_ns += response_latencies_ns[len(request_times_ns) - 1]
+        if len(request_times_ns) >= len(response_latencies_ns):
+            source._stop.set()
+        return b"payload"
+
+    monkeypatch.setattr("vesc_py.fast_imu_source.open_blocking_io", fake_open_blocking_io)
+    monkeypatch.setattr("vesc_py.fast_imu_source._wait_until_ns", fake_wait_until_ns)
+    monkeypatch.setattr(
+        "vesc_py.fast_imu_source._read_expected_imu_packet",
+        fake_read_expected_imu_packet,
+    )
+    monkeypatch.setattr(
+        "vesc_py.fast_imu_source.time.perf_counter_ns",
+        lambda: clock_ns,
+    )
+    monkeypatch.setattr(source, "_value_from_payload", lambda _payload: 1.25)
+
+    source._run()
+
+    timestamps, _values, latencies, _stats = source.drain_with_response_latency()
+    assert request_times_ns == [1_000_000_000, 1_002_000_000, 1_004_000_000]
+    assert timestamps.tolist() == pytest.approx([0.0, 0.002, 0.004])
+    assert latencies.tolist() == pytest.approx([0.0002, 0.0014, 0.0001])

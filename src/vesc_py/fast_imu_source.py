@@ -548,7 +548,7 @@ class VescImuSignalSource:
                         self._last_error = str(exc)
                     continue
 
-                sample_s = (now_ns - self._start_ns) / NSEC_PER_SEC
+                sample_s = (previous_request_ns - self._start_ns) / NSEC_PER_SEC
                 pending_timestamps.append(sample_s)
                 pending_values.append(value)
                 pending_response_latencies.append(response_latency_s)
