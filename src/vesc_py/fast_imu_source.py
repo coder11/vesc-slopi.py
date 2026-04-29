@@ -381,6 +381,7 @@ class VescImuSignalSource:
         self._mask = imu_axes_mask((self._axis,))
         self._request = build_imu_request(self._mask, can_id=can_id)
         self._samples = PendingSignalBuffer(pending_samples)
+        self._response_latencies = PendingSignalBuffer(pending_samples)
         self._stats = ImuSourceStats()
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -397,6 +398,14 @@ class VescImuSignalSource:
     @property
     def unit(self) -> str:
         return imu_axis_unit(self._axis)
+
+    @property
+    def response_latency_channel_name(self) -> str:
+        return "response_latency"
+
+    @property
+    def response_latency_unit(self) -> str:
+        return "s"
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -418,10 +427,52 @@ class VescImuSignalSource:
             self._serial_port.close()
             self._serial_port = None
 
-    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], SignalSourceStats]:
+    def drain(
+        self,
+    ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], SignalSourceStats]:
+        timestamps, values, _latencies, stats = self._drain_with_response_latency()
+        return timestamps, values, stats
+
+    def drain_with_response_latency(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        SignalSourceStats,
+    ]:
+        """Drain IMU samples with request-to-response latency for each sample."""
+        return self._drain_with_response_latency()
+
+    def _drain_with_response_latency(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        SignalSourceStats,
+    ]:
         timestamps, values, _dropped_interval, buf_stats = self._samples.drain()
+        _latency_timestamps, latencies, _latency_dropped, _latency_stats = (
+            self._response_latencies.drain()
+        )
         with self._lock:
-            return timestamps, values, SignalSourceStats(
+            stats = SignalSourceStats(
+                samples=buf_stats.sample_count,
+                dropped=buf_stats.cumulative_dropped,
+                errors=self._stats.errors,
+                average_rate_hz=buf_stats.average_rate_hz,
+                latest_sample_s=buf_stats.latest_sample_s,
+                latest_value=buf_stats.latest_value,
+                last_error=self._last_error,
+                done=self._done.is_set(),
+            )
+        return timestamps, values, latencies, stats
+
+    def source_stats(self) -> SignalSourceStats:
+        buf_stats = self._samples.pending_stats()
+        with self._lock:
+            return SignalSourceStats(
                 samples=buf_stats.sample_count,
                 dropped=buf_stats.cumulative_dropped,
                 errors=self._stats.errors,
@@ -432,8 +483,8 @@ class VescImuSignalSource:
                 done=self._done.is_set(),
             )
 
-    def source_stats(self) -> SignalSourceStats:
-        buf_stats = self._samples.pending_stats()
+    def response_latency_stats(self) -> SignalSourceStats:
+        buf_stats = self._response_latencies.pending_stats()
         with self._lock:
             return SignalSourceStats(
                 samples=buf_stats.sample_count,
@@ -453,6 +504,7 @@ class VescImuSignalSource:
         self._start_ns = time.perf_counter_ns()
         pending_timestamps: list[float] = []
         pending_values: list[float] = []
+        pending_response_latencies: list[float] = []
         next_flush_ns = self._start_ns + 5_000_000
         previous_request_ns: int | None = None
         try:
@@ -482,6 +534,7 @@ class VescImuSignalSource:
                     self._stats,
                 )
                 now_ns = time.perf_counter_ns()
+                response_latency_s = (now_ns - previous_request_ns) / NSEC_PER_SEC
                 if payload is None:
                     self._stats.timeouts += 1
                     serial_port.reset_input_buffer()
@@ -498,13 +551,19 @@ class VescImuSignalSource:
                 sample_s = (now_ns - self._start_ns) / NSEC_PER_SEC
                 pending_timestamps.append(sample_s)
                 pending_values.append(value)
+                pending_response_latencies.append(response_latency_s)
                 with self._lock:
                     self._last_error = None
 
                 if len(pending_timestamps) >= 64 or now_ns >= next_flush_ns:
                     self._samples.append_many(pending_timestamps, pending_values)
+                    self._response_latencies.append_many(
+                        pending_timestamps,
+                        pending_response_latencies,
+                    )
                     pending_timestamps.clear()
                     pending_values.clear()
+                    pending_response_latencies.clear()
                     next_flush_ns = now_ns + 5_000_000
         except Exception as exc:  # noqa: BLE001 - source errors are surfaced in status.
             with self._lock:
@@ -513,6 +572,10 @@ class VescImuSignalSource:
         finally:
             if pending_timestamps:
                 self._samples.append_many(pending_timestamps, pending_values)
+                self._response_latencies.append_many(
+                    pending_timestamps,
+                    pending_response_latencies,
+                )
             if self._serial_port is not None:
                 self._serial_port.close()
                 self._serial_port = None

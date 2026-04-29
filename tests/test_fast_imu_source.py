@@ -177,6 +177,15 @@ def test_vesc_source_run_caps_poll_rate(
     source._run()
 
     assert len(write_times) == 3
+    latency_stats = source.response_latency_stats()
+    assert latency_stats.latest_value is not None
+    assert latency_stats.latest_value >= 0.0
+    timestamps, values, latencies, stats = source.drain_with_response_latency()
+    assert timestamps.size == 3
+    assert values.size == 3
+    assert latencies.size == 3
+    assert stats.latest_value == pytest.approx(1.25)
+    assert all(latency >= 0.0 for latency in latencies)
     intervals = [later - earlier for earlier, later in zip(write_times, write_times[1:])]
     assert intervals[0] >= 0.045
     assert intervals[1] >= 0.045
