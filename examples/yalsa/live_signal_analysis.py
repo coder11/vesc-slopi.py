@@ -56,12 +56,14 @@ from yalsa import (
     SeriesData,
     SignalBatch,
     SignalBatchSource,
-    SignalBatchSourceSnapshot,
+    SignalBatchSourceStats,
     butter_lowpass_hz,
     choice_parameter,
     fft_magnitude,
     float_parameter,
     int_parameter,
+    merge_signal_batch_source_stats,
+    pending_batch_ring_stats,
     run_live_analysis,
     signal_stats,
     welch_psd,
@@ -175,6 +177,7 @@ class PendingSignalBatchBuffer:
         self._write_index = 0
         self._count = 0
         self._dropped = 0
+        self._cumulative_dropped = 0
 
     def append_many(
         self,
@@ -204,7 +207,9 @@ class PendingSignalBatchBuffer:
 
         with self._lock:
             if count >= self._capacity:
-                self._dropped += self._count + count - self._capacity
+                drop = self._count + count - self._capacity
+                self._dropped += drop
+                self._cumulative_dropped += drop
                 self._timestamps[:] = timestamp_values[-self._capacity :]
                 for channel_name in self._channel_names:
                     self._values[channel_name][:] = channel_values[channel_name][
@@ -219,6 +224,7 @@ class PendingSignalBatchBuffer:
             if overflow > 0:
                 self._read_index = (self._read_index + overflow) % self._capacity
                 self._dropped += overflow
+                self._cumulative_dropped += overflow
             self._count = min(self._capacity, self._count + count)
 
             first_count = min(count, self._capacity - self._write_index)
@@ -240,29 +246,44 @@ class PendingSignalBatchBuffer:
 
             self._write_index = (self._write_index + count) % self._capacity
 
-    def drain(self) -> tuple[SignalBatch, int]:
-        """Return pending samples in order and clear the pending ring."""
+    def pending_source_stats(self, *, rate_label: str) -> SignalBatchSourceStats:
+        """Stats from the current pending ring without consuming samples."""
         with self._lock:
-            count = self._count
-            dropped = self._dropped
+            batch = self._pending_batch_locked()
+            cumulative = self._cumulative_dropped
+        return pending_batch_ring_stats(
+            batch, cumulative_dropped=cumulative, rate_label=rate_label
+        )
+
+    def drain(
+        self,
+        *,
+        rate_label: str,
+    ) -> tuple[SignalBatch, SignalBatchSourceStats]:
+        """Return pending samples in order, clear the ring, and ring-aligned stats."""
+        with self._lock:
             self._dropped = 0
+            count = self._count
             if count == 0:
                 empty = np.empty(0, dtype=np.float64)
-                return (
-                    SignalBatch(
-                        timestamps_s=empty,
-                        values={
-                            channel_name: empty for channel_name in self._channel_names
-                        },
-                        units=self._channels,
-                    ),
-                    dropped,
+                batch = SignalBatch(
+                    timestamps_s=empty,
+                    values={
+                        channel_name: empty for channel_name in self._channel_names
+                    },
+                    units=self._channels,
                 )
+                stats = pending_batch_ring_stats(
+                    batch,
+                    cumulative_dropped=self._cumulative_dropped,
+                    rate_label=rate_label,
+                )
+                return batch, stats
 
             read_index = self._read_index
             if read_index + count <= self._capacity:
                 timestamps = self._timestamps[read_index : read_index + count].copy()
-                values = {
+                values_map = {
                     channel_name: self._values[channel_name][
                         read_index : read_index + count
                     ].copy()
@@ -276,7 +297,7 @@ class PendingSignalBatchBuffer:
                         self._timestamps[: count - first_count],
                     )
                 )
-                values = {
+                values_map = {
                     channel_name: np.concatenate(
                         (
                             self._values[channel_name][read_index:],
@@ -288,14 +309,60 @@ class PendingSignalBatchBuffer:
 
             self._read_index = self._write_index
             self._count = 0
-            return (
-                SignalBatch(
-                    timestamps_s=timestamps,
-                    values=values,
-                    units=self._channels,
-                ),
-                dropped,
+            batch = SignalBatch(
+                timestamps_s=timestamps,
+                values=values_map,
+                units=self._channels,
             )
+            stats = pending_batch_ring_stats(
+                batch,
+                cumulative_dropped=self._cumulative_dropped,
+                rate_label=rate_label,
+            )
+            return batch, stats
+
+    def _pending_batch_locked(self) -> SignalBatch:
+        count = self._count
+        if count == 0:
+            empty = np.empty(0, dtype=np.float64)
+            return SignalBatch(
+                timestamps_s=empty,
+                values={
+                    channel_name: empty for channel_name in self._channel_names
+                },
+                units=self._channels,
+            )
+        read_index = self._read_index
+        if read_index + count <= self._capacity:
+            timestamps = self._timestamps[read_index : read_index + count].copy()
+            values_map = {
+                channel_name: self._values[channel_name][
+                    read_index : read_index + count
+                ].copy()
+                for channel_name in self._channel_names
+            }
+        else:
+            first_count = self._capacity - read_index
+            timestamps = np.concatenate(
+                (
+                    self._timestamps[read_index:],
+                    self._timestamps[: count - first_count],
+                )
+            )
+            values_map = {
+                channel_name: np.concatenate(
+                    (
+                        self._values[channel_name][read_index:],
+                        self._values[channel_name][: count - first_count],
+                    )
+                )
+                for channel_name in self._channel_names
+            }
+        return SignalBatch(
+            timestamps_s=timestamps,
+            values=values_map,
+            units=self._channels,
+        )
 
 
 class DeterministicImuBatchSource:
@@ -322,11 +389,6 @@ class DeterministicImuBatchSource:
         self._lock = threading.Lock()
         self._start_ns = 0
         self._sample_index = 0
-        self._sample_count = 0
-        self._dropped = 0
-        self._average_rate_hz = 0.0
-        self._latest_sample_s: float | None = None
-        self._latest_values: dict[str, float] = {}
 
     @property
     def channels(self) -> Mapping[str, str]:
@@ -349,25 +411,21 @@ class DeterministicImuBatchSource:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
-    def drain(self) -> tuple[SignalBatch, int]:
-        batch, dropped = self._samples.drain()
-        if dropped:
-            with self._lock:
-                self._dropped += dropped
-        return batch, dropped
-
-    def snapshot(self) -> SignalBatchSourceSnapshot:
+    def drain(self) -> tuple[SignalBatch, SignalBatchSourceStats]:
+        batch, ring = self._samples.drain(rate_label="Data acquisition rate")
         with self._lock:
-            return SignalBatchSourceSnapshot(
-                samples=self._sample_count,
-                dropped=self._dropped,
-                errors=0,
-                average_rate_hz=self._average_rate_hz,
-                latest_sample_s=self._latest_sample_s,
-                latest_values=dict(self._latest_values),
-                last_error=None,
-                done=self._done.is_set(),
-            )
+            done = self._done.is_set()
+        return batch, merge_signal_batch_source_stats(
+            ring, errors=0, last_error=None, done=done
+        )
+
+    def source_stats(self) -> SignalBatchSourceStats:
+        ring = self._samples.pending_source_stats(rate_label="Data acquisition rate")
+        with self._lock:
+            done = self._done.is_set()
+        return merge_signal_batch_source_stats(
+            ring, errors=0, last_error=None, done=done
+        )
 
     def _value_for_sample(self, sample_index: int) -> float:
         if self._source == "deterministic-noisy":
@@ -408,15 +466,6 @@ class DeterministicImuBatchSource:
                 self._samples.append_many(timestamps, values)
                 self._sample_index += due_count
                 next_sample_ns += due_count * sample_period_ns
-
-                with self._lock:
-                    self._sample_count += due_count
-                    self._latest_sample_s = timestamps[-1]
-                    self._average_rate_hz = self._sample_rate_hz
-                    self._latest_values = {
-                        axis: channel_values[-1]
-                        for axis, channel_values in values.items()
-                    }
         finally:
             self._done.set()
 
@@ -459,11 +508,6 @@ class VescImuBatchSignalSource:
         self._thread: threading.Thread | None = None
         self._serial_port: BlockingIo | None = None
         self._start_ns = 0
-        self._sample_count = 0
-        self._dropped = 0
-        self._average_rate_hz = 0.0
-        self._latest_sample_s: float | None = None
-        self._latest_values: dict[str, float] = {}
         self._last_error: str | None = None
 
     @property
@@ -490,26 +534,33 @@ class VescImuBatchSignalSource:
             self._serial_port.close()
             self._serial_port = None
 
-    def drain(self) -> tuple[SignalBatch, int]:
-        batch, dropped = self._samples.drain()
-        if dropped:
-            with self._lock:
-                self._dropped += dropped
-        return batch, dropped
-
-    def snapshot(self) -> SignalBatchSourceSnapshot:
+    def drain(self) -> tuple[SignalBatch, SignalBatchSourceStats]:
+        batch, ring = self._samples.drain(rate_label="VESC poll rate")
         with self._lock:
-            return SignalBatchSourceSnapshot(
-                samples=self._sample_count,
-                dropped=self._dropped,
-                errors=self._stats.errors,
-                average_rate_hz=self._average_rate_hz,
-                latest_sample_s=self._latest_sample_s,
-                latest_values=dict(self._latest_values),
-                last_error=self._last_error,
-                done=self._done.is_set(),
-                rate_label="VESC poll rate",
-            )
+            done = self._done.is_set()
+            last_error = self._last_error
+            errors = self._stats.errors
+        return batch, merge_signal_batch_source_stats(
+            ring,
+            errors=errors,
+            last_error=last_error,
+            done=done,
+            rate_label="VESC poll rate",
+        )
+
+    def source_stats(self) -> SignalBatchSourceStats:
+        ring = self._samples.pending_source_stats(rate_label="VESC poll rate")
+        with self._lock:
+            done = self._done.is_set()
+            last_error = self._last_error
+            errors = self._stats.errors
+        return merge_signal_batch_source_stats(
+            ring,
+            errors=errors,
+            last_error=last_error,
+            done=done,
+            rate_label="VESC poll rate",
+        )
 
     def _run(self) -> None:
         self._start_ns = time.perf_counter_ns()
@@ -562,13 +613,6 @@ class VescImuBatchSignalSource:
                 for axis, value in values.items():
                     pending_values[axis].append(value)
                 with self._lock:
-                    self._sample_count += 1
-                    elapsed_s = (now_ns - self._start_ns) / NSEC_PER_SEC
-                    self._average_rate_hz = (
-                        self._sample_count / elapsed_s if elapsed_s > 0.0 else 0.0
-                    )
-                    self._latest_sample_s = sample_s
-                    self._latest_values = dict(values)
                     self._last_error = None
 
                 if len(pending_timestamps) >= 64 or now_ns >= next_flush_ns:

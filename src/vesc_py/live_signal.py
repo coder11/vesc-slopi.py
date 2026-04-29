@@ -18,8 +18,47 @@ FloatArray = npt.NDArray[np.float64]
 
 
 @dataclass(frozen=True, slots=True)
-class SignalSourceSnapshot:
-    """Low-rate status data exposed by a live signal source."""
+class PendingBufferStats:
+    """Stats derived from pending-buffer sample timestamps and values."""
+
+    cumulative_dropped: int
+    sample_count: int
+    average_rate_hz: float
+    latest_sample_s: float | None
+    latest_value: float | None
+
+
+def pending_buffer_stats_from_arrays(
+    timestamps: FloatArray,
+    values: FloatArray,
+    *,
+    cumulative_dropped: int,
+) -> PendingBufferStats:
+    """Build stats for one batch or peek using the same rules as signal data."""
+    n = int(np.asarray(timestamps).size)
+    if n == 0:
+        return PendingBufferStats(cumulative_dropped, 0, 0.0, None, None)
+    if n != int(np.asarray(values).size):
+        raise ValueError("timestamp and value counts must match")
+    ts = np.asarray(timestamps, dtype=np.float64)
+    vals = np.asarray(values, dtype=np.float64)
+    if n >= 2:
+        elapsed = float(ts[-1] - ts[0])
+        rate = (n - 1) / elapsed if elapsed > 0.0 else 0.0
+    else:
+        rate = 0.0
+    return PendingBufferStats(
+        cumulative_dropped=cumulative_dropped,
+        sample_count=n,
+        average_rate_hz=rate,
+        latest_sample_s=float(ts[-1]),
+        latest_value=float(vals[-1]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SignalSourceStats:
+    """Low-rate status data for a live scalar signal source."""
 
     samples: int
     dropped: int
@@ -44,9 +83,9 @@ class SignalSource(Protocol):
 
     def stop(self, timeout: float = 1.0) -> None: ...
 
-    def drain(self) -> tuple[FloatArray, FloatArray, int]: ...
+    def drain(self) -> tuple[FloatArray, FloatArray, SignalSourceStats]: ...
 
-    def snapshot(self) -> SignalSourceSnapshot: ...
+    def source_stats(self) -> SignalSourceStats: ...
 
 
 class PendingSignalBuffer:
@@ -63,6 +102,7 @@ class PendingSignalBuffer:
         self._write_index = 0
         self._count = 0
         self._dropped = 0
+        self._cumulative_dropped = 0
 
     def append(self, timestamp_s: float, value: float) -> None:
         """Append one sample, overwriting the oldest pending sample if full."""
@@ -85,7 +125,9 @@ class PendingSignalBuffer:
 
         with self._lock:
             if count >= self._capacity:
-                self._dropped += self._count + count - self._capacity
+                drop = self._count + count - self._capacity
+                self._dropped += drop
+                self._cumulative_dropped += drop
                 self._timestamps[:] = timestamp_values[-self._capacity :]
                 self._values[:] = sample_values[-self._capacity :]
                 self._read_index = 0
@@ -97,6 +139,7 @@ class PendingSignalBuffer:
             if overflow > 0:
                 self._read_index = (self._read_index + overflow) % self._capacity
                 self._dropped += overflow
+                self._cumulative_dropped += overflow
             self._count = min(self._capacity, self._count + count)
 
             first_count = min(count, self._capacity - self._write_index)
@@ -114,17 +157,33 @@ class PendingSignalBuffer:
 
             self._write_index = (self._write_index + count) % self._capacity
 
-    def drain(self) -> tuple[FloatArray, FloatArray, int]:
-        """Return pending samples in order and clear the pending ring."""
+    def pending_stats(self) -> PendingBufferStats:
+        """Stats from the current pending ring without consuming samples."""
+        with self._lock:
+            timestamps, values = self._pending_arrays_locked()
+            return pending_buffer_stats_from_arrays(
+                timestamps,
+                values,
+                cumulative_dropped=self._cumulative_dropped,
+            )
+
+    def drain(self) -> tuple[FloatArray, FloatArray, int, PendingBufferStats]:
+        """Return pending samples in order, interval drops, and ring-aligned stats."""
         with self._lock:
             count = self._count
-            dropped = self._dropped
+            dropped_interval = self._dropped
             self._dropped = 0
             if count == 0:
+                stats = pending_buffer_stats_from_arrays(
+                    np.empty(0, dtype=np.float64),
+                    np.empty(0, dtype=np.float64),
+                    cumulative_dropped=self._cumulative_dropped,
+                )
                 return (
                     np.empty(0, dtype=np.float64),
                     np.empty(0, dtype=np.float64),
-                    dropped,
+                    dropped_interval,
+                    stats,
                 )
 
             read_index = self._read_index
@@ -148,7 +207,38 @@ class PendingSignalBuffer:
 
             self._read_index = self._write_index
             self._count = 0
-            return timestamps, values, dropped
+            stats = pending_buffer_stats_from_arrays(
+                timestamps,
+                values,
+                cumulative_dropped=self._cumulative_dropped,
+            )
+            return timestamps, values, dropped_interval, stats
+
+    def _pending_arrays_locked(self) -> tuple[FloatArray, FloatArray]:
+        count = self._count
+        if count == 0:
+            empty = np.empty(0, dtype=np.float64)
+            return empty, empty
+        read_index = self._read_index
+        if read_index + count <= self._capacity:
+            return (
+                self._timestamps[read_index : read_index + count].copy(),
+                self._values[read_index : read_index + count].copy(),
+            )
+        first_count = self._capacity - read_index
+        timestamps = np.concatenate(
+            (
+                self._timestamps[read_index:],
+                self._timestamps[: count - first_count],
+            )
+        )
+        values = np.concatenate(
+            (
+                self._values[read_index:],
+                self._values[: count - first_count],
+            )
+        )
+        return timestamps, values
 
 
 class SignalRingHistory:
@@ -289,6 +379,25 @@ def deterministic_noisy_signal_value(
     return base + mid_tone + high_tone + white_noise
 
 
+def _stats_from_pending(
+    pending: PendingBufferStats,
+    *,
+    errors: int,
+    last_error: str | None,
+    done: bool,
+) -> SignalSourceStats:
+    return SignalSourceStats(
+        samples=pending.sample_count,
+        dropped=pending.cumulative_dropped,
+        errors=errors,
+        average_rate_hz=pending.average_rate_hz,
+        latest_sample_s=pending.latest_sample_s,
+        latest_value=pending.latest_value,
+        last_error=last_error,
+        done=done,
+    )
+
+
 class DeterministicSignalSource:
     """Repeatable synthetic signal source implementing the SignalSource protocol."""
 
@@ -312,10 +421,6 @@ class DeterministicSignalSource:
         self._lock = threading.Lock()
         self._start_ns = 0
         self._sample_index = 0
-        self._sample_count = 0
-        self._dropped = 0
-        self._latest_sample_s: float | None = None
-        self._latest_value: float | None = None
 
     @property
     def channel_name(self) -> str:
@@ -342,31 +447,27 @@ class DeterministicSignalSource:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
-    def drain(self) -> tuple[FloatArray, FloatArray, int]:
-        timestamps, values, dropped = self._samples.drain()
-        if dropped:
-            with self._lock:
-                self._dropped += dropped
-        return timestamps, values, dropped
-
-    def snapshot(self) -> SignalSourceSnapshot:
+    def drain(self) -> tuple[FloatArray, FloatArray, SignalSourceStats]:
+        timestamps, values, _dropped_interval, buf_stats = self._samples.drain()
         with self._lock:
-            elapsed_s = (
-                (time.perf_counter_ns() - self._start_ns) / NSEC_PER_SEC
-                if self._start_ns > 0
-                else 0.0
-            )
-            average_rate = self._sample_count / elapsed_s if elapsed_s > 0.0 else 0.0
-            return SignalSourceSnapshot(
-                samples=self._sample_count,
-                dropped=self._dropped,
-                errors=0,
-                average_rate_hz=average_rate,
-                latest_sample_s=self._latest_sample_s,
-                latest_value=self._latest_value,
-                last_error=None,
-                done=self._done.is_set(),
-            )
+            done = self._done.is_set()
+        return timestamps, values, _stats_from_pending(
+            buf_stats,
+            errors=0,
+            last_error=None,
+            done=done,
+        )
+
+    def source_stats(self) -> SignalSourceStats:
+        pending = self._samples.pending_stats()
+        with self._lock:
+            done = self._done.is_set()
+        return _stats_from_pending(
+            pending,
+            errors=0,
+            last_error=None,
+            done=done,
+        )
 
     def _value_for_sample(self, sample_index: int) -> float:
         return deterministic_signal_value(sample_index, self._sample_rate_hz)
@@ -401,11 +502,6 @@ class DeterministicSignalSource:
                 self._samples.append_many(timestamps, values)
                 self._sample_index += due_count
                 next_sample_ns += due_count * sample_period_ns
-
-                with self._lock:
-                    self._sample_count += due_count
-                    self._latest_sample_s = float(timestamps[-1])
-                    self._latest_value = float(values[-1])
         finally:
             self._done.set()
 
@@ -429,10 +525,12 @@ __all__ = [
     "DeterministicSignalSource",
     "FloatArray",
     "NoisyDeterministicSignalSource",
+    "PendingBufferStats",
     "PendingSignalBuffer",
     "SignalRingHistory",
     "SignalSource",
-    "SignalSourceSnapshot",
+    "SignalSourceStats",
+    "pending_buffer_stats_from_arrays",
     "deterministic_noisy_signal_value",
     "deterministic_signal_value",
     "deterministic_white_noise",

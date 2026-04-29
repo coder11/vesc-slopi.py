@@ -23,7 +23,7 @@ def test_pending_signal_buffer_drains_samples_in_order_after_overwrite() -> None
     for index in range(5):
         buffer.append(float(index), float(index + 10))
 
-    timestamps, values, dropped = buffer.drain()
+    timestamps, values, dropped, _stats = buffer.drain()
 
     assert timestamps.tolist() == [2.0, 3.0, 4.0]
     assert values.tolist() == [12.0, 13.0, 14.0]
@@ -39,7 +39,7 @@ def test_pending_signal_buffer_reports_batch_overwrite_count() -> None:
         np.array([11.0, 12.0, 13.0, 14.0], dtype=np.float64),
     )
 
-    timestamps, values, dropped = buffer.drain()
+    timestamps, values, dropped, _stats = buffer.drain()
 
     assert timestamps.tolist() == [1.0, 2.0, 3.0, 4.0]
     assert values.tolist() == [11.0, 12.0, 13.0, 14.0]
@@ -132,13 +132,15 @@ def test_deterministic_source_produces_repeatable_interface_samples() -> None:
     source.start()
     time.sleep(0.03)
     source.stop()
-    timestamps, values, _dropped = source.drain()
-    snapshot = source.snapshot()
+    timestamps, values, drain_stats = source.drain()
+    peek_stats = source.source_stats()
 
     assert source.channel_name == "acc_z"
     assert source.unit == "g"
-    assert snapshot.samples >= 1
-    assert snapshot.done
+    assert drain_stats.samples >= 1
+    assert drain_stats.done
+    assert peek_stats.samples == 0
+    assert peek_stats.done
     assert timestamps.size == values.size
     assert timestamps.size >= 1
     for timestamp, value in zip(timestamps, values):
@@ -191,7 +193,7 @@ def test_noisy_deterministic_source_uses_noisy_signal_function() -> None:
     source.start()
     time.sleep(0.03)
     source.stop()
-    timestamps, values, _dropped = source.drain()
+    timestamps, values, _stats = source.drain()
 
     assert timestamps.size == values.size
     assert timestamps.size >= 1
@@ -214,7 +216,7 @@ def test_deterministic_white_noise_source_uses_white_noise_function() -> None:
     source.start()
     time.sleep(0.03)
     source.stop()
-    timestamps, values, _dropped = source.drain()
+    timestamps, values, _stats = source.drain()
 
     assert timestamps.size == values.size
     assert timestamps.size >= 1

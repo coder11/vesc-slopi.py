@@ -11,7 +11,7 @@ from examples.yalsa.live_signal_analysis import (
     make_source,
 )
 from vesc_py.connection import VescConnection, VescTarget
-from yalsa import AnalysisInput, SignalBatch, SignalBatchSourceSnapshot
+from yalsa import AnalysisInput, SignalBatch, SignalBatchSourceStats
 
 
 def test_clamp_cutoff_hz_limits_requested_frequency_to_nyquist_margin() -> None:
@@ -44,15 +44,13 @@ def test_make_source_labels_vesc_snapshot_rate_as_poll_rate() -> None:
     target = VescTarget(VescConnection.serial("/dev/ttyACM0"), can_id=7)
 
     source, _source_label = make_source(config, vesc_target=target)
-    snapshot = source.snapshot()
+    stats = source.source_stats()
 
-    assert snapshot.rate_label == "VESC poll rate"
-    assert snapshot.average_rate_hz == pytest.approx(0.0)
+    assert stats.rate_label == "VESC poll rate"
+    assert stats.average_rate_hz == pytest.approx(0.0)
 
 
-def test_vesc_snapshot_uses_acquisition_thread_rate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_vesc_source_stats_average_rate_matches_pending_ring_timestamps() -> None:
     source = live_signal_analysis.VescImuBatchSignalSource(
         connection=VescConnection.serial("/dev/ttyACM0"),
         axes=("acc_z", "gyro_z"),
@@ -60,20 +58,14 @@ def test_vesc_snapshot_uses_acquisition_thread_rate(
         pending_samples=live_signal_analysis.DEFAULT_PENDING_SAMPLES,
         poll_rate_hz=500.0,
     )
-    source._average_rate_hz = 456.0
-
-    def fail_perf_counter_ns() -> int:
-        raise AssertionError("snapshot must not calculate poll rate")
-
-    monkeypatch.setattr(
-        live_signal_analysis.time,
-        "perf_counter_ns",
-        fail_perf_counter_ns,
+    source._samples.append_many(
+        [0.0, 0.01, 0.02],
+        {"acc_z": [1.0, 2.0, 3.0], "gyro_z": [0.1, 0.2, 0.3]},
     )
 
-    snapshot = source.snapshot()
+    stats = source.source_stats()
 
-    assert snapshot.average_rate_hz == pytest.approx(456.0)
+    assert stats.average_rate_hz == pytest.approx(100.0)
 
 
 def test_make_source_passes_vesc_poll_rate(
@@ -92,11 +84,11 @@ def test_make_source_passes_vesc_poll_rate(
         def stop(self, timeout: float = 1.0) -> None:
             return None
 
-        def drain(self) -> tuple[object, object, int]:
+        def drain(self) -> tuple[object, object]:
             raise AssertionError("drain should not be called in this test")
 
-        def snapshot(self) -> object:
-            raise AssertionError("snapshot should not be called in this test")
+        def source_stats(self) -> object:
+            raise AssertionError("source_stats should not be called in this test")
 
     monkeypatch.setattr(
         live_signal_analysis,
@@ -135,7 +127,7 @@ def test_build_axis_analysis_processor_returns_expected_series() -> None:
             units={"acc_z": "g"},
         ),
         sample_rate_hz=200.0,
-        snapshot=SignalBatchSourceSnapshot(
+        source_stats=SignalBatchSourceStats(
             samples=400,
             dropped=0,
             errors=0,
@@ -180,7 +172,7 @@ def test_build_axis_analysis_processor_reports_cutoff_clamp() -> None:
             units={"acc_z": "g"},
         ),
         sample_rate_hz=100.0,
-        snapshot=SignalBatchSourceSnapshot(
+        source_stats=SignalBatchSourceStats(
             samples=200,
             dropped=0,
             errors=0,

@@ -24,7 +24,7 @@ from vesc_py.imu import IMU_FIELDS
 from vesc_py.live_signal import (
     NSEC_PER_SEC,
     PendingSignalBuffer,
-    SignalSourceSnapshot,
+    SignalSourceStats,
 )
 from vesc_py.packet import MAX_PACKET_LEN
 
@@ -388,10 +388,6 @@ class VescImuSignalSource:
         self._thread: threading.Thread | None = None
         self._serial_port: BlockingIo | None = None
         self._start_ns = 0
-        self._sample_count = 0
-        self._dropped = 0
-        self._latest_sample_s: float | None = None
-        self._latest_value: float | None = None
         self._last_error: str | None = None
 
     @property
@@ -422,28 +418,30 @@ class VescImuSignalSource:
             self._serial_port.close()
             self._serial_port = None
 
-    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], int]:
-        timestamps, values, dropped = self._samples.drain()
-        if dropped:
-            with self._lock:
-                self._dropped += dropped
-        return timestamps, values, dropped
-
-    def snapshot(self) -> SignalSourceSnapshot:
+    def drain(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], SignalSourceStats]:
+        timestamps, values, _dropped_interval, buf_stats = self._samples.drain()
         with self._lock:
-            elapsed_s = (
-                (time.perf_counter_ns() - self._start_ns) / NSEC_PER_SEC
-                if self._start_ns > 0
-                else 0.0
-            )
-            average_rate = self._sample_count / elapsed_s if elapsed_s > 0.0 else 0.0
-            return SignalSourceSnapshot(
-                samples=self._sample_count,
-                dropped=self._dropped,
+            return timestamps, values, SignalSourceStats(
+                samples=buf_stats.sample_count,
+                dropped=buf_stats.cumulative_dropped,
                 errors=self._stats.errors,
-                average_rate_hz=average_rate,
-                latest_sample_s=self._latest_sample_s,
-                latest_value=self._latest_value,
+                average_rate_hz=buf_stats.average_rate_hz,
+                latest_sample_s=buf_stats.latest_sample_s,
+                latest_value=buf_stats.latest_value,
+                last_error=self._last_error,
+                done=self._done.is_set(),
+            )
+
+    def source_stats(self) -> SignalSourceStats:
+        buf_stats = self._samples.pending_stats()
+        with self._lock:
+            return SignalSourceStats(
+                samples=buf_stats.sample_count,
+                dropped=buf_stats.cumulative_dropped,
+                errors=self._stats.errors,
+                average_rate_hz=buf_stats.average_rate_hz,
+                latest_sample_s=buf_stats.latest_sample_s,
+                latest_value=buf_stats.latest_value,
                 last_error=self._last_error,
                 done=self._done.is_set(),
             )
@@ -501,9 +499,6 @@ class VescImuSignalSource:
                 pending_timestamps.append(sample_s)
                 pending_values.append(value)
                 with self._lock:
-                    self._sample_count += 1
-                    self._latest_sample_s = sample_s
-                    self._latest_value = value
                     self._last_error = None
 
                 if len(pending_timestamps) >= 64 or now_ns >= next_flush_ns:

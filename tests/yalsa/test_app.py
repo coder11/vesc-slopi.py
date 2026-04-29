@@ -15,7 +15,7 @@ from yalsa import (
     ScalarSignalSourceAdapter,
     SignalBatch,
     SignalBatchHistory,
-    SignalBatchSourceSnapshot,
+    SignalBatchSourceStats,
     choice_parameter,
     default_parameter_values,
     float_parameter,
@@ -53,22 +53,36 @@ class _FiniteBatchSource:
     def stop(self, timeout: float = 1.0) -> None:
         self.stopped = True
 
-    def drain(self) -> tuple[SignalBatch, int]:
+    def drain(self) -> tuple[SignalBatch, SignalBatchSourceStats]:
         if self._index >= len(self._batches):
-            return yalsa_app.empty_signal_batch(self.channels), 0
+            empty = yalsa_app.empty_signal_batch(self.channels)
+            ring = yalsa_app.pending_batch_ring_stats(empty, cumulative_dropped=0)
+            stats = yalsa_app.merge_signal_batch_source_stats(
+                ring,
+                errors=0,
+                last_error=None,
+                done=self.stopped,
+            )
+            return empty, stats
         batch = self._batches[self._index]
         self._index += 1
         self._samples += batch.sample_count
         if batch.sample_count > 0:
             self._latest_sample_s = float(batch.timestamps_s[-1])
             self._latest_value = float(batch.channel("acc_z")[-1])
-        return batch, 0
+        ring = yalsa_app.pending_batch_ring_stats(batch, cumulative_dropped=0)
+        return batch, yalsa_app.merge_signal_batch_source_stats(
+            ring,
+            errors=0,
+            last_error=None,
+            done=self.stopped,
+        )
 
-    def snapshot(self) -> SignalBatchSourceSnapshot:
+    def source_stats(self) -> SignalBatchSourceStats:
         latest_values = (
             {} if self._latest_value is None else {"acc_z": self._latest_value}
         )
-        return SignalBatchSourceSnapshot(
+        return SignalBatchSourceStats(
             samples=self._samples,
             dropped=0,
             errors=0,
@@ -221,15 +235,16 @@ def test_scalar_signal_source_adapter_exposes_batch_protocol() -> None:
     source.start()
     time.sleep(0.03)
     source.stop()
-    batch, dropped = source.drain()
-    snapshot = source.snapshot()
+    batch, stats = source.drain()
 
     assert source.channels == {"acc_z": "g"}
-    assert dropped >= 0
     assert batch.sample_count >= 1
     assert batch.channel("acc_z").size == batch.timestamps_s.size
-    assert snapshot.samples >= 1
-    assert snapshot.done
+    assert stats.samples >= 1
+    assert stats.done
+
+    peek = source.source_stats()
+    assert peek.samples >= 0
 
 
 def test_live_analysis_status_lines_include_signal_and_source_data() -> None:
@@ -239,7 +254,7 @@ def test_live_analysis_status_lines_include_signal_and_source_data() -> None:
             status_text="mode: PSD | raw RMS: 0.5 g | filtered RMS: 0.4 g",
         ),
         process_error=None,
-        source_snapshot=SignalBatchSourceSnapshot(
+        source_stats=SignalBatchSourceStats(
             samples=10,
             dropped=2,
             errors=1,

@@ -20,7 +20,7 @@ from typing import Any, Literal, Protocol, TypeAlias, cast
 import numpy as np
 import numpy.typing as npt
 
-from vesc_py.live_signal import SignalSource, SignalSourceSnapshot
+from vesc_py.live_signal import SignalSource, SignalSourceStats
 
 FloatArray = npt.NDArray[np.float64]
 ParamValue: TypeAlias = int | float | bool | str
@@ -99,7 +99,7 @@ def empty_signal_batch(channels: Mapping[str, str]) -> SignalBatch:
 
 
 @dataclass(frozen=True, slots=True)
-class SignalBatchSourceSnapshot:
+class SignalBatchSourceStats:
     """Low-rate status data exposed by a batch signal source."""
 
     samples: int
@@ -113,6 +113,59 @@ class SignalBatchSourceSnapshot:
     rate_label: str = "Data acquisition rate"
 
 
+def pending_batch_ring_stats(
+    batch: SignalBatch,
+    *,
+    cumulative_dropped: int,
+    rate_label: str = "Data acquisition rate",
+) -> SignalBatchSourceStats:
+    """Stats aligned with the supplied batch timestamps and channel values."""
+    timestamps = batch.timestamps_s
+    n = int(timestamps.size)
+    if n >= 2:
+        elapsed = float(timestamps[-1] - timestamps[0])
+        rate = (n - 1) / elapsed if elapsed > 0.0 else 0.0
+    else:
+        rate = 0.0
+    latest_sample_s = float(timestamps[-1]) if n else None
+    latest_values = (
+        {name: float(batch.values[name][-1]) for name in batch.values} if n else {}
+    )
+    return SignalBatchSourceStats(
+        samples=n,
+        dropped=cumulative_dropped,
+        errors=0,
+        average_rate_hz=rate,
+        latest_sample_s=latest_sample_s,
+        latest_values=latest_values,
+        last_error=None,
+        done=False,
+        rate_label=rate_label,
+    )
+
+
+def merge_signal_batch_source_stats(
+    ring: SignalBatchSourceStats,
+    *,
+    errors: int,
+    last_error: str | None,
+    done: bool,
+    rate_label: str | None = None,
+) -> SignalBatchSourceStats:
+    """Overlay transport or lifecycle fields onto ring-aligned stats."""
+    return SignalBatchSourceStats(
+        samples=ring.samples,
+        dropped=ring.dropped,
+        errors=errors,
+        average_rate_hz=ring.average_rate_hz,
+        latest_sample_s=ring.latest_sample_s,
+        latest_values=dict(ring.latest_values),
+        last_error=last_error,
+        done=done,
+        rate_label=ring.rate_label if rate_label is None else rate_label,
+    )
+
+
 class SignalBatchSource(Protocol):
     """Common interface for live signal sources exposed to the analysis app."""
 
@@ -123,9 +176,9 @@ class SignalBatchSource(Protocol):
 
     def stop(self, timeout: float = 1.0) -> None: ...
 
-    def drain(self) -> tuple[SignalBatch, int]: ...
+    def drain(self) -> tuple[SignalBatch, SignalBatchSourceStats]: ...
 
-    def snapshot(self) -> SignalBatchSourceSnapshot: ...
+    def source_stats(self) -> SignalBatchSourceStats: ...
 
 
 class ScalarSignalSourceAdapter:
@@ -145,36 +198,39 @@ class ScalarSignalSourceAdapter:
     def stop(self, timeout: float = 1.0) -> None:
         self._source.stop(timeout=timeout)
 
-    def drain(self) -> tuple[SignalBatch, int]:
-        timestamps, values, dropped = self._source.drain()
+    def drain(self) -> tuple[SignalBatch, SignalBatchSourceStats]:
+        timestamps, values, stats = self._source.drain()
         batch = SignalBatch(
             timestamps_s=timestamps,
             values={self._source.channel_name: values},
             units=self._channels,
         )
-        return batch, dropped
-
-    def snapshot(self) -> SignalBatchSourceSnapshot:
-        snapshot = self._source.snapshot()
         latest_values: dict[str, float] = {}
-        if snapshot.latest_value is not None:
-            latest_values[self._source.channel_name] = snapshot.latest_value
-        return _scalar_snapshot_to_batch(snapshot, latest_values)
+        if stats.latest_value is not None:
+            latest_values[self._source.channel_name] = stats.latest_value
+        return batch, _scalar_stats_to_batch(stats, latest_values)
+
+    def source_stats(self) -> SignalBatchSourceStats:
+        stats = self._source.source_stats()
+        latest_values: dict[str, float] = {}
+        if stats.latest_value is not None:
+            latest_values[self._source.channel_name] = stats.latest_value
+        return _scalar_stats_to_batch(stats, latest_values)
 
 
-def _scalar_snapshot_to_batch(
-    snapshot: SignalSourceSnapshot,
+def _scalar_stats_to_batch(
+    stats: SignalSourceStats,
     latest_values: Mapping[str, float],
-) -> SignalBatchSourceSnapshot:
-    return SignalBatchSourceSnapshot(
-        samples=snapshot.samples,
-        dropped=snapshot.dropped,
-        errors=snapshot.errors,
-        average_rate_hz=snapshot.average_rate_hz,
-        latest_sample_s=snapshot.latest_sample_s,
+) -> SignalBatchSourceStats:
+    return SignalBatchSourceStats(
+        samples=stats.samples,
+        dropped=stats.dropped,
+        errors=stats.errors,
+        average_rate_hz=stats.average_rate_hz,
+        latest_sample_s=stats.latest_sample_s,
         latest_values=dict(latest_values),
-        last_error=snapshot.last_error,
-        done=snapshot.done,
+        last_error=stats.last_error,
+        done=stats.done,
         rate_label="Data acquisition rate",
     )
 
@@ -523,7 +579,7 @@ class AnalysisInput:
 
     batch: SignalBatch
     sample_rate_hz: float | None
-    snapshot: SignalBatchSourceSnapshot
+    source_stats: SignalBatchSourceStats
 
     @property
     def timestamps_s(self) -> FloatArray:
@@ -686,7 +742,7 @@ PLOT_THEMES = {
 class _AnalysisWorkerSnapshot:
     result: AnalysisResult | None
     process_error: str | None
-    source_snapshot: SignalBatchSourceSnapshot
+    source_stats: SignalBatchSourceStats
     history_rate_hz: float | None
 
 
@@ -896,7 +952,7 @@ def _initial_analysis_snapshot() -> _AnalysisWorkerSnapshot:
     return _AnalysisWorkerSnapshot(
         result=None,
         process_error=None,
-        source_snapshot=SignalBatchSourceSnapshot(
+        source_stats=SignalBatchSourceStats(
             samples=0,
             dropped=0,
             errors=0,
@@ -931,7 +987,7 @@ class _LiveAnalysisWorker:
         self._source_started = False
         self._last_result: AnalysisResult | None = None
         self._last_process_error: str | None = None
-        self._source_snapshot = config.source.snapshot()
+        self._source_stats = config.source.source_stats()
         self._history_rate_hz: float | None = None
         self._last_status_update_ns = 0
 
@@ -945,7 +1001,7 @@ class _LiveAnalysisWorker:
             with self._state_lock:
                 self._last_result = None
                 self._last_process_error = None
-                self._source_snapshot = self._config.source.snapshot()
+                self._source_stats = self._config.source.source_stats()
                 self._history_rate_hz = None
             self._config.source.start()
             self._source_started = True
@@ -987,7 +1043,7 @@ class _LiveAnalysisWorker:
             return _AnalysisWorkerSnapshot(
                 result=self._last_result,
                 process_error=self._last_process_error,
-                source_snapshot=self._source_snapshot,
+                source_stats=self._source_stats,
                 history_rate_hz=self._history_rate_hz,
             )
 
@@ -1002,7 +1058,7 @@ class _LiveAnalysisWorker:
                     self._clear_requested.clear()
                     self._history.clear()
 
-                batch, _dropped = self._config.source.drain()
+                batch, drain_stats = self._config.source.drain()
                 has_new_samples = batch.sample_count > 0
                 if has_new_samples:
                     self._history.append_batch(batch)
@@ -1012,7 +1068,12 @@ class _LiveAnalysisWorker:
                     self._process_requested.clear()
 
                 if has_new_samples or forced_process:
-                    self._process_latest()
+                    source_stats = (
+                        drain_stats
+                        if has_new_samples
+                        else self._config.source.source_stats()
+                    )
+                    self._process_latest(source_stats)
                 else:
                     self._update_source_status_if_due()
                     self._stop.wait(_ANALYSIS_IDLE_SLEEP_S)
@@ -1020,13 +1081,12 @@ class _LiveAnalysisWorker:
             with self._state_lock:
                 self._last_process_error = f"analysis worker error: {exc}"
 
-    def _process_latest(self) -> None:
+    def _process_latest(self, source_stats: SignalBatchSourceStats) -> None:
         history_rate_hz = self._history.sample_hz()
-        source_snapshot = self._config.source.snapshot()
         analysis_input = AnalysisInput(
             batch=self._history.snapshot(),
             sample_rate_hz=history_rate_hz,
-            snapshot=source_snapshot,
+            source_stats=source_stats,
         )
         try:
             result = self._config.process(analysis_input, self._parameter_snapshot())
@@ -1040,7 +1100,7 @@ class _LiveAnalysisWorker:
             if process_error is None:
                 self._last_result = result
             self._last_process_error = process_error
-            self._source_snapshot = source_snapshot
+            self._source_stats = source_stats
             self._history_rate_hz = history_rate_hz
 
     def _update_source_status_if_due(self) -> None:
@@ -1049,7 +1109,7 @@ class _LiveAnalysisWorker:
             return
         self._last_status_update_ns = now_ns
         with self._state_lock:
-            self._source_snapshot = self._config.source.snapshot()
+            self._source_stats = self._config.source.source_stats()
             self._history_rate_hz = self._history.sample_hz()
 
 
@@ -1149,13 +1209,13 @@ def _follow_latest_x_range(
 
 
 def _format_latest_values(
-    snapshot: SignalBatchSourceSnapshot,
+    stats: SignalBatchSourceStats,
     channels: Mapping[str, str],
 ) -> str:
-    if not snapshot.latest_values:
+    if not stats.latest_values:
         return "n/a"
     parts = []
-    for channel_name, value in snapshot.latest_values.items():
+    for channel_name, value in stats.latest_values.items():
         unit = channels.get(channel_name, "")
         parts.append(f"{channel_name}={value:.6g}{(' ' + unit) if unit else ''}")
     return ", ".join(parts)
@@ -1192,13 +1252,13 @@ QComboBox QAbstractItemView {{
 
 
 def _format_latest_value_lines(
-    snapshot: SignalBatchSourceSnapshot,
+    stats: SignalBatchSourceStats,
     channels: Mapping[str, str],
 ) -> list[str]:
-    if not snapshot.latest_values:
+    if not stats.latest_values:
         return ["current: n/a"]
     lines: list[str] = []
-    for channel_name, value in snapshot.latest_values.items():
+    for channel_name, value in stats.latest_values.items():
         unit = channels.get(channel_name, "")
         suffix = f" {unit}" if unit else ""
         lines.append(f"current {channel_name}: {value:.6g}{suffix}")
@@ -1215,10 +1275,10 @@ def _signal_status_lines(
     worker_snapshot: _AnalysisWorkerSnapshot,
     channels: Mapping[str, str],
 ) -> list[str]:
-    snapshot = worker_snapshot.source_snapshot
-    lines = _format_latest_value_lines(snapshot, channels)
-    if snapshot.last_error:
-        lines.append(f"source error: {snapshot.last_error}")
+    src_stats = worker_snapshot.source_stats
+    lines = _format_latest_value_lines(src_stats, channels)
+    if src_stats.last_error:
+        lines.append(f"source error: {src_stats.last_error}")
     if worker_snapshot.process_error:
         lines.append(f"analysis error: {worker_snapshot.process_error}")
     elif worker_snapshot.result is not None:
@@ -1227,17 +1287,17 @@ def _signal_status_lines(
 
 
 def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
-    snapshot = worker_snapshot.source_snapshot
-    rate_label = snapshot.rate_label[:1].lower() + snapshot.rate_label[1:]
+    src_stats = worker_snapshot.source_stats
+    rate_label = src_stats.rate_label[:1].lower() + src_stats.rate_label[1:]
     lines = [
-        f"{rate_label}: {_format_rate(snapshot.average_rate_hz)}",
+        f"{rate_label}: {_format_rate(src_stats.average_rate_hz)}",
         f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
-        f"samples: {snapshot.samples}",
-        f"dropped: {snapshot.dropped}",
-        f"errors: {snapshot.errors}",
+        f"samples: {src_stats.samples}",
+        f"dropped: {src_stats.dropped}",
+        f"errors: {src_stats.errors}",
     ]
-    if snapshot.last_error:
-        lines.append(f"source error: {snapshot.last_error}")
+    if src_stats.last_error:
+        lines.append(f"source error: {src_stats.last_error}")
     if worker_snapshot.process_error:
         lines.append(f"analysis error: {worker_snapshot.process_error}")
     return lines
@@ -1246,8 +1306,9 @@ def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
 def _debug_toggle_text(worker_snapshot: _AnalysisWorkerSnapshot | None) -> str:
     if worker_snapshot is None:
         return "Data acquisition rate: measuring"
-    source_rate = _format_rate(worker_snapshot.source_snapshot.average_rate_hz)
-    return f"{worker_snapshot.source_snapshot.rate_label}: {source_rate}"
+    src_stats = worker_snapshot.source_stats
+    source_rate = _format_rate(src_stats.average_rate_hz)
+    return f"{src_stats.rate_label}: {source_rate}"
 
 
 def _read_live_analysis_control(slot: _PickleSharedMemorySlot) -> _LiveAnalysisControl:
@@ -1292,7 +1353,7 @@ def _snapshot_without_result(
     return _AnalysisWorkerSnapshot(
         result=None,
         process_error=process_error,
-        source_snapshot=snapshot.source_snapshot,
+        source_stats=snapshot.source_stats,
         history_rate_hz=snapshot.history_rate_hz,
     )
 
@@ -1312,7 +1373,7 @@ def _analysis_process_error_snapshot(error: str) -> _AnalysisWorkerSnapshot:
     return _AnalysisWorkerSnapshot(
         result=None,
         process_error=error,
-        source_snapshot=snapshot.source_snapshot,
+        source_stats=snapshot.source_stats,
         history_rate_hz=snapshot.history_rate_hz,
     )
 
@@ -1885,7 +1946,7 @@ __all__ = [
     "SignalBatch",
     "SignalBatchHistory",
     "SignalBatchSource",
-    "SignalBatchSourceSnapshot",
+    "SignalBatchSourceStats",
     "bool_parameter",
     "choice_parameter",
     "default_parameter_values",
@@ -1894,6 +1955,8 @@ __all__ = [
     "import_pyqtgraph",
     "int_parameter",
     "live_analysis_ui_config",
+    "merge_signal_batch_source_stats",
+    "pending_batch_ring_stats",
     "prefer_qt_xcb_platform",
     "require_qt_platform_runtime",
     "run_live_analysis",
