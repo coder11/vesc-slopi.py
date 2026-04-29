@@ -1748,17 +1748,13 @@ def _run_live_analysis_gui(
                 dtype=float,
             )
 
-            lx, ly, lz = 2.5, 1.35, 0.32
+            lx, ly = 2.5, 1.35
             vertices = np.array(
                 [
-                    [-lx / 2, -ly / 2, -lz / 2],
-                    [lx / 2, -ly / 2, -lz / 2],
-                    [lx / 2, ly / 2, -lz / 2],
-                    [-lx / 2, ly / 2, -lz / 2],
-                    [-lx / 2, -ly / 2, lz / 2],
-                    [lx / 2, -ly / 2, lz / 2],
-                    [lx / 2, ly / 2, lz / 2],
-                    [-lx / 2, ly / 2, lz / 2],
+                    [-lx / 2, -ly / 2, 0.0],
+                    [lx / 2, -ly / 2, 0.0],
+                    [lx / 2, ly / 2, 0.0],
+                    [-lx / 2, ly / 2, 0.0],
                 ],
                 dtype=float,
             )
@@ -1769,35 +1765,19 @@ def _run_live_analysis_gui(
                 screen_y = center_y + (point[1] * 0.26 - point[2]) * scale
                 return QtCore.QPointF(float(screen_x), float(screen_y))
 
-            faces = [
-                ((0, 1, 2, 3), QtGui.QColor("#9a9a9a")),
-                ((0, 4, 5, 1), QtGui.QColor("#b3b3b3")),
-                ((1, 5, 6, 2), QtGui.QColor("#8a8a8a")),
-                ((2, 6, 7, 3), QtGui.QColor("#747474")),
-                ((3, 7, 4, 0), QtGui.QColor("#a8a8a8")),
-                ((4, 7, 6, 5), QtGui.QColor("#25206f")),
-            ]
-            faces.sort(key=lambda face: float(np.mean(points[list(face[0]), 1])))
-            painter.setPen(QtGui.QPen(QtGui.QColor("#1c1c1c"), 1))
-            for indexes, color in faces:
-                polygon = QtGui.QPolygonF([project(points[index]) for index in indexes])
-                painter.setBrush(QtGui.QBrush(color))
-                painter.drawPolygon(polygon)
+            # Matches oblique projection above: ray from eye into the scene.
+            ray = np.asarray([0.42, 1.0, 0.26], dtype=float)
+            ray /= float(np.linalg.norm(ray))
+            z_axis_world = rotation[:, 2]
+            top_toward_camera = float(np.dot(z_axis_world, ray)) < 0.0
+            face_color = (
+                QtGui.QColor("#3b7dd6") if top_toward_camera else QtGui.QColor("#9a9a9a")
+            )
 
-            feature_vertices = np.array(
-                [
-                    [0.45, -0.35, lz / 2 + 0.01],
-                    [1.0, -0.35, lz / 2 + 0.01],
-                    [1.0, 0.2, lz / 2 + 0.01],
-                    [0.45, 0.2, lz / 2 + 0.01],
-                ],
-                dtype=float,
-            )
-            feature_points = feature_vertices @ rotation.T
-            painter.setBrush(QtGui.QBrush(QtGui.QColor("#101010")))
-            painter.drawPolygon(
-                QtGui.QPolygonF([project(point) for point in feature_points])
-            )
+            polygon = QtGui.QPolygonF([project(points[i]) for i in range(4)])
+            painter.setPen(QtGui.QPen(QtGui.QColor("#1c1c1c"), 1))
+            painter.setBrush(QtGui.QBrush(face_color))
+            painter.drawPolygon(polygon)
             painter.end()
 
     root = QtWidgets.QVBoxLayout(window)
