@@ -1053,8 +1053,13 @@ def _axis_section_label(section: str) -> str:
     return "Accel" if section == "accel" else "Gyro"
 
 
-def _axis_metric_name(axis: str) -> str:
-    return f"{axis}_rms"
+# Sidebar metrics per axis (raw window), matching legacy imu_signal_bench SignalStats.
+_AXIS_METRICS: tuple[tuple[str, str], ...] = (
+    ("mean", "Mean"),
+    ("std", "Std"),
+    ("rms", "RMS"),
+    ("peak_to_peak", "Peak-to-peak"),
+)
 
 
 def _axis_tab_label(axis: str) -> str:
@@ -1266,7 +1271,10 @@ def build_multi_axis_analysis_processor(
             filtered_stats = signal_stats(filtered)
             unit = units[axis]
             if raw_stats is not None:
-                metrics[_axis_metric_name(axis)] = f"{raw_stats.rms:.6g} {unit}"
+                for field, _label in _AXIS_METRICS:
+                    metrics[f"{axis}_{field}"] = (
+                        f"{getattr(raw_stats, field):.6g} {unit}"
+                    )
                 status_parts.append(f"{axis} raw RMS: {raw_stats.rms:.6g} {unit}")
             if filtered_stats is not None:
                 status_parts.append(
@@ -1447,12 +1455,13 @@ def build_analysis(
         ),
         metrics=tuple(
             MetricSpec(
-                name=_axis_metric_name(axis_name),
-                label="RMS",
+                name=f"{axis_name}_{field}",
+                label=label,
                 section=_axis_section(axis_name),
                 group=_axis_group_label(axis_name),
             )
             for axis_name in axes
+            for field, label in _AXIS_METRICS
         ),
         plots=tuple(plots),
         process=process,

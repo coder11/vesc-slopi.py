@@ -268,10 +268,22 @@ def test_build_multi_axis_analysis_processor_uses_independent_filters() -> None:
     } <= set(result.series)
     assert not np.array_equal(result.series["acc_x_filtered"].y, acc_values)
     assert not np.array_equal(result.series["gyro_z_filtered"].y, gyro_values)
-    assert result.metrics == {
-        "acc_x_rms": "0.707107 g",
-        "gyro_z_rms": "0.707107 deg/s",
+    assert set(result.metrics.keys()) == {
+        f"{axis}_{field}"
+        for axis in ("acc_x", "gyro_z")
+        for field in ("mean", "std", "rms", "peak_to_peak")
     }
+    assert result.metrics["acc_x_rms"] == "0.707107 g"
+    assert result.metrics["acc_x_std"] == "0.707107 g"
+    assert result.metrics["acc_x_peak_to_peak"] == "2 g"
+    assert float(result.metrics["acc_x_mean"].split()[0]) == pytest.approx(0.0, abs=1e-14)
+    assert result.metrics["gyro_z_rms"] == "0.707107 deg/s"
+    assert result.metrics["gyro_z_std"] == "0.707107 deg/s"
+    assert result.metrics["gyro_z_peak_to_peak"] == "2 deg/s"
+    assert float(result.metrics["gyro_z_mean"].split()[0]) == pytest.approx(
+        0.0,
+        abs=1e-14,
+    )
     assert result.status_text is not None
     assert "acc_x: lowpass, cutoff 10.00 Hz, order 2" in result.status_text
     assert "gyro_z: lowpass, cutoff 40.00 Hz, order 4" in result.status_text
@@ -512,7 +524,10 @@ def test_build_multi_axis_analysis_processor_skips_mahony_when_hidden(
     assert "mahony_yaw" not in result.series
 
 
-def test_build_analysis_exposes_live_tunable_parameters() -> None:
+def test_build_analysis_exposes_live_tunable_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_signal_analysis, "DEFAULT_SHOW_3D_OBJECT", False)
     config = LiveSignalAnalysisConfig(
         source="deterministic",
     )
@@ -593,15 +608,20 @@ def test_build_analysis_exposes_live_tunable_parameters() -> None:
     ]
     assert app.plots[11].title == "Mahony RPY"
     assert app.plots[11].widget == "empty"
+    metric_fields = ("mean", "std", "rms", "peak_to_peak")
     assert [metric.name for metric in app.metrics] == [
-        "acc_x_rms",
-        "acc_y_rms",
-        "acc_z_rms",
-        "gyro_x_rms",
-        "gyro_y_rms",
-        "gyro_z_rms",
+        f"{axis}_{field}"
+        for axis in ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
+        for field in metric_fields
     ]
-    assert [metric.group for metric in app.metrics] == ["X", "Y", "Z", "X", "Y", "Z"]
+    assert [metric.label for metric in app.metrics] == [
+        label
+        for _axis in range(6)
+        for label in ("Mean", "Std", "RMS", "Peak-to-peak")
+    ]
+    assert [metric.group for metric in app.metrics] == (
+        ["X"] * 4 + ["Y"] * 4 + ["Z"] * 4
+    ) * 2
     assert [parameter.group for parameter in app.parameters[:9]] == [
         "X",
         "X",
