@@ -90,6 +90,7 @@ FREQUENCY_PLOT_X_RANGE: tuple[float, float] | None = (
 )
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
+DEFAULT_FILTER_TYPE = "none"
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
 ACCEL_AXES = ("acc_x", "acc_y", "acc_z")
@@ -1408,7 +1409,7 @@ def build_analysis(
                 choice_parameter(
                     _axis_filter_type_parameter_name(axis_name),
                     label="filter",
-                    default="lowpass",
+                    default=DEFAULT_FILTER_TYPE,
                     choices=FILTER_OPTIONS,
                     section=_axis_section(axis_name),
                     group=_axis_group_label(axis_name),
