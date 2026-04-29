@@ -4,12 +4,18 @@ import time
 import pytest
 
 from vesc_py.connection import VescConnection
+from vesc_py.buffer import VescBuffer
+from vesc_py.comm_ids import CommPacketId
 from vesc_py.fast_imu_source import (
     VescImuSignalSource,
+    imu_axes_mask,
     imu_axis_display_value,
     imu_axis_mask,
     imu_axis_unit,
+    imu_data_from_payload,
+    imu_values_from_payload,
     parse_imu_axis,
+    parse_imu_axes,
 )
 
 
@@ -27,6 +33,13 @@ def test_parse_imu_axis_rejects_unknown_axis() -> None:
         parse_imu_axis("temperature")
 
 
+def test_parse_imu_axes_rejects_empty_and_duplicate_axes() -> None:
+    with pytest.raises(ValueError, match="at least one"):
+        parse_imu_axes(())
+    with pytest.raises(ValueError, match="unique"):
+        parse_imu_axes(("acc_z", "accel-z"))
+
+
 def test_imu_axis_mask_matches_expected_field_bits() -> None:
     assert imu_axis_mask("roll") == 1 << 0
     assert imu_axis_mask("pitch") == 1 << 1
@@ -37,6 +50,26 @@ def test_imu_axis_mask_matches_expected_field_bits() -> None:
     assert imu_axis_mask("gyro_x") == 1 << 6
     assert imu_axis_mask("gyro_y") == 1 << 7
     assert imu_axis_mask("gyro_z") == 1 << 8
+    assert imu_axes_mask(("acc_z", "gyro_z")) == (1 << 5) | (1 << 8)
+
+
+def test_imu_values_from_payload_extracts_ordered_axis_values() -> None:
+    buffer = VescBuffer()
+    buffer.append_uint8(CommPacketId.COMM_GET_IMU_DATA)
+    buffer.append_uint16((1 << 5) | (1 << 8))
+    buffer.append_double32_auto(0.5)
+    buffer.append_double32_auto(42.0)
+
+    payload = buffer.to_bytes()
+    imu_data = imu_data_from_payload(payload)
+
+    assert imu_data.response_mask == (1 << 5) | (1 << 8)
+    assert imu_data.acc_z == pytest.approx(0.5)
+    assert imu_data.gyro_z == pytest.approx(42.0)
+    assert imu_values_from_payload(payload, ("gyro_z", "acc_z")) == {
+        "gyro_z": pytest.approx(42.0),
+        "acc_z": pytest.approx(0.5),
+    }
 
 
 def test_imu_axis_units_match_display_values() -> None:

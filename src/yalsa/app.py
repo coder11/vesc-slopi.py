@@ -110,6 +110,7 @@ class SignalBatchSourceSnapshot:
     latest_values: Mapping[str, float]
     last_error: str | None
     done: bool
+    rate_label: str = "Data acquisition rate"
 
 
 class SignalBatchSource(Protocol):
@@ -174,6 +175,7 @@ def _scalar_snapshot_to_batch(
         latest_values=dict(latest_values),
         last_error=snapshot.last_error,
         done=snapshot.done,
+        rate_label="Data acquisition rate",
     )
 
 
@@ -1226,8 +1228,9 @@ def _signal_status_lines(
 
 def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
     snapshot = worker_snapshot.source_snapshot
+    rate_label = snapshot.rate_label[:1].lower() + snapshot.rate_label[1:]
     lines = [
-        f"source: {_format_rate(snapshot.average_rate_hz)}",
+        f"{rate_label}: {_format_rate(snapshot.average_rate_hz)}",
         f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
         f"samples: {snapshot.samples}",
         f"dropped: {snapshot.dropped}",
@@ -1242,9 +1245,9 @@ def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
 
 def _debug_toggle_text(worker_snapshot: _AnalysisWorkerSnapshot | None) -> str:
     if worker_snapshot is None:
-        return "Source rate: measuring"
+        return "Data acquisition rate: measuring"
     source_rate = _format_rate(worker_snapshot.source_snapshot.average_rate_hz)
-    return f"Source rate: {source_rate}"
+    return f"{worker_snapshot.source_snapshot.rate_label}: {source_rate}"
 
 
 def _read_live_analysis_control(slot: _PickleSharedMemorySlot) -> _LiveAnalysisControl:

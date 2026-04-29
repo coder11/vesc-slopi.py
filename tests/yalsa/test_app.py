@@ -259,14 +259,17 @@ def test_live_analysis_status_lines_include_signal_and_source_data() -> None:
         "filtered RMS: 0.4 g",
     ]
     assert yalsa_app._debug_status_lines(worker_snapshot) == [
-        "source: 123.0 Hz",
+        "data acquisition rate: 123.0 Hz",
         "history: 120.0 Hz",
         "samples: 10",
         "dropped: 2",
         "errors: 1",
     ]
-    assert yalsa_app._debug_toggle_text(worker_snapshot) == "Source rate: 123.0 Hz"
-    assert yalsa_app._debug_toggle_text(None) == "Source rate: measuring"
+    assert (
+        yalsa_app._debug_toggle_text(worker_snapshot)
+        == "Data acquisition rate: 123.0 Hz"
+    )
+    assert yalsa_app._debug_toggle_text(None) == "Data acquisition rate: measuring"
 
 
 def test_qt_theme_stylesheet_forces_light_widget_palette() -> None:
