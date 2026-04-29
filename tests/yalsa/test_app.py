@@ -183,6 +183,32 @@ def test_xy_series_rejects_length_mismatch() -> None:
         xy_series(np.array([0.0], dtype=np.float64), np.array([], dtype=np.float64))
 
 
+def test_plot_spec_rejects_invalid_mouse_mode() -> None:
+    with pytest.raises(ValueError, match="mouse_mode must be 'pan' or 'rect'"):
+        PlotSpec(
+            title="time",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="time",
+            y_label="acc_z",
+            mouse_mode="scale-box",  # type: ignore[arg-type]
+        )
+
+
+def test_plot_spec_rejects_invalid_x_axis_mode() -> None:
+    with pytest.raises(ValueError, match="x_axis_mode must be 'auto' or 'follow_latest'"):
+        PlotSpec(
+            title="time",
+            traces=(PlotTrace(series="raw", label="Raw"),),
+            x_label="time",
+            y_label="acc_z",
+            x_axis_mode="fixed",  # type: ignore[arg-type]
+        )
+
+
+def test_follow_latest_x_range_expands_single_point() -> None:
+    assert yalsa_app._follow_latest_x_range(2.0, 2.0) == pytest.approx((1.9, 2.1))
+
+
 def test_scalar_signal_source_adapter_exposes_batch_protocol() -> None:
     scalar_source = DeterministicSignalSource(
         channel_name="acc_z",
@@ -360,6 +386,13 @@ def test_live_analysis_ui_config_excludes_script_runtime_objects() -> None:
     assert ui_config.title == "test"
     assert ui_config.channels == {"acc_z": "g"}
     assert ui_config.plots[0].title == "time"
+    assert ui_config.plots[0].auto_range_x is True
+    assert ui_config.plots[0].auto_range_y is True
+    assert ui_config.plots[0].allow_mouse_x is True
+    assert ui_config.plots[0].allow_mouse_y is True
+    assert ui_config.plots[0].mouse_mode == "pan"
+    assert ui_config.plots[0].x_axis_mode == "auto"
+    assert ui_config.plots[0].allow_left_drag is True
     assert not hasattr(ui_config, "source")
     assert not hasattr(ui_config, "process")
 

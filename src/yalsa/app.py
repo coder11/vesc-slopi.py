@@ -496,12 +496,23 @@ class PlotSpec:
     max_points: int | None = None
     log_x: bool = False
     log_y: bool = False
+    auto_range_x: bool = True
+    auto_range_y: bool = True
+    allow_mouse_x: bool = True
+    allow_mouse_y: bool = True
+    mouse_mode: Literal["pan", "rect"] = "pan"
+    x_axis_mode: Literal["auto", "follow_latest"] = "auto"
+    allow_left_drag: bool = True
 
     def __post_init__(self) -> None:
         if not self.traces:
             raise ValueError("plots must contain at least one trace")
         if self.max_points is not None and self.max_points <= 0:
             raise ValueError("max_points must be greater than 0")
+        if self.mouse_mode not in ("pan", "rect"):
+            raise ValueError("mouse_mode must be 'pan' or 'rect'")
+        if self.x_axis_mode not in ("auto", "follow_latest"):
+            raise ValueError("x_axis_mode must be 'auto' or 'follow_latest'")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1099,6 +1110,42 @@ def _format_rate(value: float | None) -> str:
     return "measuring" if value is None else f"{value:.1f} Hz"
 
 
+def _configure_plot_interaction(plot_item: Any, plot_spec: PlotSpec) -> None:
+    view_box = plot_item.getViewBox()
+    mouse_mode = view_box.PanMode
+    if plot_spec.mouse_mode == "rect":
+        mouse_mode = view_box.RectMode
+    view_box.setMouseMode(mouse_mode)
+    plot_item.setMouseEnabled(
+        x=plot_spec.allow_mouse_x,
+        y=plot_spec.allow_mouse_y,
+    )
+    view_box.enableAutoRange(
+        x=plot_spec.auto_range_x and plot_spec.x_axis_mode == "auto",
+        y=plot_spec.auto_range_y,
+    )
+
+
+def _series_x_range(series: SeriesData) -> tuple[float, float] | None:
+    if int(series.x.size) == 0:
+        return None
+    minimum = float(np.min(series.x))
+    maximum = float(np.max(series.x))
+    return minimum, maximum
+
+
+def _follow_latest_x_range(
+    x_min: float,
+    x_max: float,
+) -> tuple[float, float]:
+    if x_max <= x_min:
+        padding = 0.5 if x_min == 0.0 else abs(x_min) * 0.05
+        if padding == 0.0:
+            padding = 0.5
+        return x_min - padding, x_max + padding
+    return x_min, x_max
+
+
 def _format_latest_values(
     snapshot: SignalBatchSourceSnapshot,
     channels: Mapping[str, str],
@@ -1347,6 +1394,26 @@ def _run_live_analysis_gui(
     qt_alignment = getattr(QtCore.Qt, "AlignmentFlag", QtCore.Qt)
     qt_arrow = getattr(QtCore.Qt, "ArrowType", QtCore.Qt)
     qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
+    qt_mouse_button = getattr(QtCore.Qt, "MouseButton", QtCore.Qt)
+
+    class _PlotViewBox(pg.ViewBox):
+        def __init__(self, *, allow_left_drag: bool) -> None:
+            super().__init__()
+            self._allow_left_drag = allow_left_drag
+
+        def mouseDragEvent(self, ev: Any, axis: int | None = None) -> None:
+            if (
+                not self._allow_left_drag
+                and axis is None
+                and ev.button()
+                in (
+                    qt_mouse_button.LeftButton,
+                    qt_mouse_button.MiddleButton,
+                )
+            ):
+                ev.ignore()
+                return
+            super().mouseDragEvent(ev, axis=axis)
 
     root = QtWidgets.QVBoxLayout(window)
     root.setContentsMargins(8, 8, 8, 8)
@@ -1444,9 +1511,13 @@ def _run_live_analysis_gui(
 
     plot_items: list[Any] = []
     plot_curves: list[dict[str, Any]] = []
+    plot_has_seen_data = [False] * len(config.plots)
     color_cycle = cycle(selected_theme.line_colors)
     for plot_index, plot_spec in enumerate(config.plots):
-        widget = pg.PlotWidget(title=plot_spec.title)
+        widget = pg.PlotWidget(
+            title=plot_spec.title,
+            viewBox=_PlotViewBox(allow_left_drag=plot_spec.allow_left_drag),
+        )
         widget.setMinimumSize(0, 0)
         widget.setSizePolicy(qt_size_policy.Ignored, qt_size_policy.Ignored)
         plot_grid.addWidget(widget, plot_index // 2, plot_index % 2)
@@ -1456,7 +1527,7 @@ def _run_live_analysis_gui(
         plot_item.setLabel("left", plot_spec.y_label, units=plot_spec.y_unit)
         plot_item.setLogMode(x=plot_spec.log_x, y=plot_spec.log_y)
         plot_item.addLegend(offset=(10, 10))
-        plot_item.setMouseEnabled(x=True, y=True)
+        _configure_plot_interaction(plot_item, plot_spec)
 
         curves: dict[str, Any] = {}
         for trace in plot_spec.traces:
@@ -1491,12 +1562,17 @@ def _run_live_analysis_gui(
 
         if state_version != rendered_state_version:
             rendered_state_version = state_version
-            for plot_spec, plot_item, curves in zip(
-                config.plots,
-                plot_items,
-                plot_curves,
-                strict=True,
+            for plot_index, (plot_spec, plot_item, curves) in enumerate(
+                zip(
+                    config.plots,
+                    plot_items,
+                    plot_curves,
+                    strict=True,
+                )
             ):
+                plot_has_data = False
+                plot_x_min: float | None = None
+                plot_x_max: float | None = None
                 for trace in plot_spec.traces:
                     series = (
                         None
@@ -1509,7 +1585,24 @@ def _run_live_analysis_gui(
                         continue
                     decimated = _decimate_series(series, plot_spec.max_points)
                     curve.setData(decimated.x, decimated.y)
-                plot_item.autoRange()
+                    if int(decimated.x.size) > 0 and int(decimated.y.size) > 0:
+                        plot_has_data = True
+                    x_range = _series_x_range(series)
+                    if x_range is not None:
+                        x_min, x_max = x_range
+                        plot_x_min = x_min if plot_x_min is None else min(plot_x_min, x_min)
+                        plot_x_max = x_max if plot_x_max is None else max(plot_x_max, x_max)
+                if plot_has_data and not plot_has_seen_data[plot_index]:
+                    plot_has_seen_data[plot_index] = True
+                    if not plot_spec.auto_range_x or not plot_spec.auto_range_y:
+                        plot_item.autoRange()
+                if (
+                    plot_spec.x_axis_mode == "follow_latest"
+                    and plot_x_min is not None
+                    and plot_x_max is not None
+                ):
+                    x_min, x_max = _follow_latest_x_range(plot_x_min, plot_x_max)
+                    plot_item.setXRange(x_min, x_max, padding=0.0)
 
         signal_status.setText(
             "\n".join(_signal_status_lines(worker_snapshot, config.channels))
