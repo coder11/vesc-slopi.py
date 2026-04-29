@@ -59,12 +59,15 @@ from yalsa import (
     SignalBatch,
     SignalBatchSource,
     SignalBatchSourceStats,
-    butter_lowpass_hz,
+    biquad_lowpass_hz,
     choice_parameter,
+    ema_alpha_from_cutoff_hz,
+    ema_lowpass_hz,
     fft_magnitude,
+    fir_ma_decimator_block_hold,
     float_parameter,
-    int_parameter,
     merge_signal_batch_source_stats,
+    nominal_or_measured_sample_rate_hz,
     pending_batch_ring_stats,
     run_live_analysis,
     signal_stats,
@@ -89,7 +92,7 @@ FREQUENCY_PLOT_X_RANGE: tuple[float, float] | None = (
     else (0.0, float(DEFAULT_VESC_POLL_RATE) / 2.0)
 )
 DEFAULT_CUTOFF_HZ = 15.0
-DEFAULT_FILTER_ORDER = 2
+DEFAULT_BIQUAD_Q = 0.707
 DEFAULT_FILTER_TYPE = "none"
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
@@ -136,8 +139,10 @@ SPECTRUM_OPTIONS = (
     ChoiceOption(value="fft", label="FFT"),
 )
 FILTER_OPTIONS = (
-    ChoiceOption(value="lowpass", label="Lowpass"),
     ChoiceOption(value="none", label="None"),
+    ChoiceOption(value="ma_decimator", label="MA decimator"),
+    ChoiceOption(value="ema", label="EMA / 1-pole"),
+    ChoiceOption(value="biquad", label="Biquad LP"),
 )
 
 
@@ -184,6 +189,59 @@ def clamp_cutoff_hz(cutoff_hz: float, sample_rate_hz: float | None) -> float | N
         return None
     nyquist_margin_hz = sample_rate_hz * 0.49
     return min(cutoff_hz, nyquist_margin_hz)
+
+
+def _filter_axis_series(
+    raw: np.ndarray,
+    timestamps: np.ndarray,
+    *,
+    filter_type: str,
+    requested_cutoff_hz: float,
+    nominal_sample_rate_hz: float | None,
+    biquad_q: float,
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Apply one IMU axis filter; prefer nominal Fs, else estimate from timestamps."""
+    fs_m = nominal_or_measured_sample_rate_hz(nominal_sample_rate_hz, timestamps)
+    if filter_type == "none":
+        return raw.copy(), ()
+
+    notes: list[str] = []
+    if fs_m is None:
+        return raw.copy(), ("Fs measuring",)
+
+    eff_cutoff = clamp_cutoff_hz(requested_cutoff_hz, fs_m)
+    if eff_cutoff is None:
+        return raw.copy(), ("cutoff measuring",)
+
+    if requested_cutoff_hz != eff_cutoff:
+        notes.append(f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz")
+
+    if filter_type == "ema":
+        filtered = ema_lowpass_hz(
+            raw,
+            cutoff_hz=eff_cutoff,
+            sample_rate_hz=fs_m,
+        )
+        notes.insert(0, f"α={ema_alpha_from_cutoff_hz(eff_cutoff, fs_m):.4g}")
+    elif filter_type == "ma_decimator":
+        filtered, factor = fir_ma_decimator_block_hold(
+            raw,
+            cutoff_hz=eff_cutoff,
+            sample_rate_hz=fs_m,
+        )
+        notes.insert(0, f"N={factor}")
+    elif filter_type == "biquad":
+        filtered = biquad_lowpass_hz(
+            raw,
+            cutoff_hz=eff_cutoff,
+            sample_rate_hz=fs_m,
+            q=biquad_q,
+        )
+        notes.insert(0, f"Q={biquad_q:.4g}")
+    else:
+        raise ValueError(f"unsupported filter_type {filter_type!r}")
+
+    return filtered, tuple(notes)
 
 
 def empty_series() -> tuple[np.ndarray, np.ndarray]:
@@ -837,20 +895,42 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
             )
 
         sample_rate_hz = data.sample_rate_hz
-        requested_cutoff_hz = float(cast(float, params["cutoff_hz"]))
-        cutoff_hz = clamp_cutoff_hz(requested_cutoff_hz, sample_rate_hz)
-        filter_order = int(cast(int, params["filter_order"]))
         spectrum_mode = cast(str, params["spectrum_mode"])
+        filter_type = cast(str, params["filter_type"])
+        requested_cutoff_hz = float(cast(float, params["cutoff_hz"]))
+        biquad_q = float(cast(float, params["biquad_q"]))
+        filtered, filter_notes = _filter_axis_series(
+            raw,
+            timestamps,
+            filter_type=filter_type,
+            requested_cutoff_hz=requested_cutoff_hz,
+            nominal_sample_rate_hz=(
+                float(sample_rate_hz) if sample_rate_hz is not None else None
+            ),
+            biquad_q=biquad_q,
+        )
 
-        filtered = raw.copy()
-        if cutoff_hz is not None and int(raw.size) >= 2:
-            filtered = butter_lowpass_hz(
-                raw,
-                cutoff_hz=cutoff_hz,
-                sample_rate_hz=cast(float, sample_rate_hz),
-                order=filter_order,
-                initial_value=float(raw[0]),
+        fs_m = nominal_or_measured_sample_rate_hz(
+            float(sample_rate_hz) if sample_rate_hz is not None else None,
+            timestamps,
+        )
+        cutoff_hz_eff = (
+            None
+            if filter_type == "none"
+            else (None if fs_m is None else clamp_cutoff_hz(requested_cutoff_hz, fs_m))
+        )
+        cutoff_text = (
+            "disabled"
+            if filter_type == "none"
+            else (
+                "cutoff measuring"
+                if cutoff_hz_eff is None
+                else f"cutoff {cutoff_hz_eff:.2f} Hz"
             )
+        )
+        tail = ""
+        if filter_notes:
+            tail = ", " + ", ".join(filter_notes)
 
         if spectrum_mode == "psd":
             raw_spectrum = welch_psd(timestamps, raw)
@@ -876,17 +956,8 @@ def build_axis_analysis_processor(axis: str, unit: str) -> ProcessCallback:
         filtered_stats = signal_stats(filtered)
         status_parts = [
             f"mode: {spectrum_mode.upper()}",
-            (
-                "cutoff: measuring"
-                if cutoff_hz is None
-                else f"cutoff: {cutoff_hz:.2f} Hz"
-            ),
-            f"order: {filter_order}",
+            f"{filter_type}: {cutoff_text}{tail}",
         ]
-        if cutoff_hz is not None and cutoff_hz != requested_cutoff_hz:
-            status_parts.append(
-                f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz"
-            )
         if raw_stats is not None:
             status_parts.append(f"raw RMS: {raw_stats.rms:.6g} {unit}")
         if filtered_stats is not None:
@@ -920,24 +991,33 @@ def build_dual_axis_analysis_processor(
         timestamps = data.timestamps_s
         sample_rate_hz = data.sample_rate_hz
         requested_cutoff_hz = float(cast(float, params["cutoff_hz"]))
-        cutoff_hz = clamp_cutoff_hz(requested_cutoff_hz, sample_rate_hz)
-        filter_order = int(cast(int, params["filter_order"]))
         spectrum_mode = cast(str, params["spectrum_mode"])
+        filter_type = cast(str, params["filter_type"])
+        biquad_q = float(cast(float, params["biquad_q"]))
+        nominal_sr = float(sample_rate_hz) if sample_rate_hz is not None else None
+        fs_m = nominal_or_measured_sample_rate_hz(nominal_sr, timestamps)
+        cutoff_hz_eff = (
+            None
+            if filter_type == "none"
+            else (None if fs_m is None else clamp_cutoff_hz(requested_cutoff_hz, fs_m))
+        )
+        cutoff_text = (
+            "disabled"
+            if filter_type == "none"
+            else (
+                "cutoff measuring"
+                if cutoff_hz_eff is None
+                else f"cutoff {cutoff_hz_eff:.2f} Hz"
+            )
+        )
 
         series: dict[str, SeriesData] = {}
+        tail = ""
+        tail_ready = False
+
         status_parts = [
             f"mode: {spectrum_mode.upper()}",
-            (
-                "cutoff: measuring"
-                if cutoff_hz is None
-                else f"cutoff: {cutoff_hz:.2f} Hz"
-            ),
-            f"order: {filter_order}",
         ]
-        if cutoff_hz is not None and cutoff_hz != requested_cutoff_hz:
-            status_parts.append(
-                f"requested cutoff clamped from {requested_cutoff_hz:.2f} Hz"
-            )
 
         has_samples = False
         for prefix, selected_axis, selected_unit, label in (
@@ -954,15 +1034,18 @@ def build_dual_axis_analysis_processor(
                 continue
 
             has_samples = True
-            filtered = raw.copy()
-            if cutoff_hz is not None and int(raw.size) >= 2:
-                filtered = butter_lowpass_hz(
-                    raw,
-                    cutoff_hz=cutoff_hz,
-                    sample_rate_hz=cast(float, sample_rate_hz),
-                    order=filter_order,
-                    initial_value=float(raw[0]),
-                )
+            filtered, filter_notes = _filter_axis_series(
+                raw,
+                timestamps,
+                filter_type=filter_type,
+                requested_cutoff_hz=requested_cutoff_hz,
+                nominal_sample_rate_hz=nominal_sr,
+                biquad_q=biquad_q,
+            )
+            if not tail_ready:
+                if filter_notes:
+                    tail = ", " + ", ".join(filter_notes)
+                tail_ready = True
 
             if spectrum_mode == "psd":
                 raw_spectrum = welch_psd(timestamps, raw)
@@ -1000,6 +1083,11 @@ def build_dual_axis_analysis_processor(
                     f"{label} filtered RMS: {filtered_stats.rms:.6g} {selected_unit}"
                 )
 
+        status_parts.insert(
+            1,
+            f"{filter_type}: {cutoff_text}{tail}",
+        )
+
         if not has_samples:
             return AnalysisResult(
                 series=series,
@@ -1027,8 +1115,8 @@ def _axis_filter_type_parameter_name(axis: str) -> str:
     return f"{axis}_filter_type"
 
 
-def _axis_filter_order_parameter_name(axis: str) -> str:
-    return f"{axis}_filter_order"
+def _axis_biquad_q_parameter_name(axis: str) -> str:
+    return f"{axis}_biquad_q"
 
 
 def _axis_series_name(axis: str, suffix: str) -> str:
@@ -1172,6 +1260,8 @@ def build_multi_axis_analysis_processor(
         status_parts = [f"mode: {spectrum_mode.upper()}"]
         has_samples = False
 
+        nominal_sr = float(sample_rate_hz) if sample_rate_hz is not None else None
+
         for axis in selected_axes:
             raw = data.channel(axis)
             if int(raw.size) == 0:
@@ -1195,25 +1285,37 @@ def build_multi_axis_analysis_processor(
             requested_cutoff_hz = float(
                 cast(float, params[_axis_cutoff_parameter_name(axis)])
             )
-            cutoff_hz = clamp_cutoff_hz(requested_cutoff_hz, sample_rate_hz)
             filter_type = cast(str, params[_axis_filter_type_parameter_name(axis)])
-            filter_order = int(
-                cast(int, params[_axis_filter_order_parameter_name(axis)])
-            )
+            biquad_q = float(cast(float, params[_axis_biquad_q_parameter_name(axis)]))
 
-            filtered = raw.copy()
-            if (
-                filter_type == "lowpass"
-                and cutoff_hz is not None
-                and int(raw.size) >= 2
-            ):
-                filtered = butter_lowpass_hz(
-                    raw,
-                    cutoff_hz=cutoff_hz,
-                    sample_rate_hz=cast(float, sample_rate_hz),
-                    order=filter_order,
-                    initial_value=float(raw[0]),
+            filtered, filter_notes = _filter_axis_series(
+                raw,
+                timestamps,
+                filter_type=filter_type,
+                requested_cutoff_hz=requested_cutoff_hz,
+                nominal_sample_rate_hz=nominal_sr,
+                biquad_q=biquad_q,
+            )
+            fs_m = nominal_or_measured_sample_rate_hz(nominal_sr, timestamps)
+            cutoff_hz_eff = (
+                None
+                if filter_type == "none"
+                else (
+                    None if fs_m is None else clamp_cutoff_hz(requested_cutoff_hz, fs_m)
                 )
+            )
+            cutoff_text = (
+                "disabled"
+                if filter_type == "none"
+                else (
+                    "cutoff measuring"
+                    if cutoff_hz_eff is None
+                    else f"cutoff {cutoff_hz_eff:.2f} Hz"
+                )
+            )
+            tail = ""
+            if filter_notes:
+                tail = ", " + ", ".join(filter_notes)
 
             if spectrum_mode == "psd":
                 raw_spectrum = welch_psd(timestamps, raw)
@@ -1246,26 +1348,7 @@ def build_multi_axis_analysis_processor(
                 filtered_spectrum_series
             )
 
-            cutoff_text = (
-                "disabled"
-                if filter_type == "none"
-                else (
-                    "cutoff measuring"
-                    if cutoff_hz is None
-                    else f"cutoff {cutoff_hz:.2f} Hz"
-                )
-            )
-            status_parts.append(
-                f"{axis}: {filter_type}, {cutoff_text}, order {filter_order}"
-            )
-            if (
-                filter_type == "lowpass"
-                and cutoff_hz is not None
-                and cutoff_hz != requested_cutoff_hz
-            ):
-                status_parts.append(
-                    f"{axis} requested cutoff clamped from {requested_cutoff_hz:.2f} Hz"
-                )
+            status_parts.append(f"{axis}: {filter_type}, {cutoff_text}{tail}")
 
             raw_stats = signal_stats(raw)
             filtered_stats = signal_stats(filtered)
@@ -1433,13 +1516,14 @@ def build_analysis(
                     section=_axis_section(axis_name),
                     group=_axis_group_label(axis_name),
                 ),
-                int_parameter(
-                    _axis_filter_order_parameter_name(axis_name),
-                    label="order",
-                    default=DEFAULT_FILTER_ORDER,
-                    minimum=1,
-                    maximum=8,
-                    step=1,
+                float_parameter(
+                    _axis_biquad_q_parameter_name(axis_name),
+                    label="biquad Q",
+                    default=DEFAULT_BIQUAD_Q,
+                    minimum=0.1,
+                    maximum=10.0,
+                    step=0.05,
+                    decimals=3,
                     section=_axis_section(axis_name),
                     group=_axis_group_label(axis_name),
                 ),

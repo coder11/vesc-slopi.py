@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -28,6 +29,18 @@ def measured_sample_rate_hz(timestamps_s: npt.ArrayLike) -> float | None:
     if not np.isfinite(sample_period_s) or sample_period_s <= 0.0:
         return None
     return 1.0 / sample_period_s
+
+
+def nominal_or_measured_sample_rate_hz(
+    nominal_hz: float | None,
+    timestamps_s: npt.ArrayLike,
+) -> float | None:
+    """Prefer a positive nominal sample rate; otherwise estimate from timestamps."""
+    if nominal_hz is not None:
+        n = float(nominal_hz)
+        if n > 0.0 and math.isfinite(n):
+            return n
+    return measured_sample_rate_hz(timestamps_s)
 
 
 def butter_lowpass_hz(
@@ -64,6 +77,118 @@ def butter_lowpass_hz(
     zi = signal.sosfilt_zi(sos) * steady_state
     filtered, _state = signal.sosfilt(sos, raw, zi=zi)
     return np.asarray(filtered, dtype=np.float64)
+
+
+def ema_alpha_from_cutoff_hz(cutoff_hz: float, sample_rate_hz: float) -> float:
+    """Smoothing coefficient for y[n]=y[n-1]+α(x[n]-y[n-1]) from a cutoff (Hz)."""
+    if cutoff_hz <= 0.0:
+        raise ValueError("cutoff_hz must be greater than 0")
+    if sample_rate_hz <= 0.0:
+        raise ValueError("sample_rate_hz must be greater than 0")
+    wc = 2.0 * math.pi * cutoff_hz / sample_rate_hz
+    return max(0.0, min(1.0, 1.0 - math.exp(-wc)))
+
+
+def ema_lowpass_hz(
+    values: npt.ArrayLike,
+    *,
+    cutoff_hz: float,
+    sample_rate_hz: float,
+) -> FloatArray:
+    """First-order low-pass: y[n] = y[n-1] + α (x[n] - y[n-1])."""
+    raw = _as_float_array(values)
+    n = int(raw.size)
+    if n == 0:
+        return raw.copy()
+    alpha = ema_alpha_from_cutoff_hz(cutoff_hz, sample_rate_hz)
+    y = np.empty_like(raw)
+    y[0] = raw[0]
+    for i in range(1, n):
+        yi = float(y[i - 1])
+        xi = float(raw[i])
+        y[i] = yi + alpha * (xi - yi)
+    return np.asarray(y, dtype=np.float64)
+
+
+def ma_decimation_factor_from_cutoff_hz(
+    cutoff_hz: float,
+    sample_rate_hz: float,
+) -> int:
+    """Block length N so Fs/N ≈ 2·fc (output rate ≈ Fs/N, Nyquist ≈ Fs/(2N))."""
+    if cutoff_hz <= 0.0:
+        raise ValueError("cutoff_hz must be greater than 0")
+    if sample_rate_hz <= 0.0:
+        raise ValueError("sample_rate_hz must be greater than 0")
+    return max(1, int(round(sample_rate_hz / (2.0 * cutoff_hz))))
+
+
+def fir_ma_decimator_block_hold(
+    values: npt.ArrayLike,
+    *,
+    cutoff_hz: float,
+    sample_rate_hz: float,
+) -> tuple[FloatArray, int]:
+    """Non-overlapping N-sample moving average; hold each mean across its block.
+
+    Same length as input so time-series plots stay aligned with raw timestamps.
+    """
+    raw = _as_float_array(values)
+    n = int(raw.size)
+    if n == 0:
+        return raw.copy(), 1
+    factor = ma_decimation_factor_from_cutoff_hz(cutoff_hz, sample_rate_hz)
+    factor = min(factor, n)
+    out = np.empty_like(raw)
+    full = (n // factor) * factor
+    for start in range(0, full, factor):
+        block_mean = float(np.mean(raw[start : start + factor]))
+        out[start : start + factor] = block_mean
+    if full < n:
+        tail_mean = float(np.mean(raw[full:]))
+        out[full:] = tail_mean
+    return np.asarray(out, dtype=np.float64), factor
+
+
+def biquad_lowpass_hz(
+    values: npt.ArrayLike,
+    *,
+    cutoff_hz: float,
+    sample_rate_hz: float,
+    q: float = 0.707,
+) -> FloatArray:
+    """Second-order low-pass (tangent prewarp), matching common VESC-style biquad."""
+    raw = _as_float_array(values)
+    n = int(raw.size)
+    if n == 0:
+        return raw.copy()
+    if cutoff_hz <= 0.0:
+        raise ValueError("cutoff_hz must be greater than 0")
+    if sample_rate_hz <= 0.0:
+        raise ValueError("sample_rate_hz must be greater than 0")
+    if q <= 0.0:
+        raise ValueError("q must be greater than 0")
+    nyquist_hz = sample_rate_hz / 2.0
+    if cutoff_hz >= nyquist_hz:
+        raise ValueError("cutoff_hz must be less than Nyquist")
+
+    k = math.tan(math.pi * cutoff_hz / sample_rate_hz)
+    norm = 1.0 / (1.0 + k / q + k * k)
+    a0 = k * k * norm
+    a1 = 2.0 * a0
+    a2 = a0
+    b1 = 2.0 * (k * k - 1.0) * norm
+    b2 = (1.0 - k / q + k * k) * norm
+
+    y = np.empty_like(raw)
+    z1 = 0.0
+    z2 = 0.0
+    for i in range(n):
+        inp = float(raw[i])
+        out = inp * a0 + z1
+        z1 = inp * a1 + z2 - b1 * out
+        z2 = inp * a2 - b2 * out
+        y[i] = out
+    return np.asarray(y, dtype=np.float64)
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,9 +278,15 @@ def welch_psd(
 __all__ = [
     "FloatArray",
     "SignalStats",
+    "biquad_lowpass_hz",
     "butter_lowpass_hz",
+    "ema_alpha_from_cutoff_hz",
+    "ema_lowpass_hz",
+    "fir_ma_decimator_block_hold",
     "fft_magnitude",
+    "ma_decimation_factor_from_cutoff_hz",
     "measured_sample_rate_hz",
+    "nominal_or_measured_sample_rate_hz",
     "signal_stats",
     "welch_psd",
 ]

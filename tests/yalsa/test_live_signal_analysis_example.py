@@ -158,8 +158,9 @@ def test_build_axis_analysis_processor_returns_expected_series() -> None:
     result = processor(
         analysis_input,
         {
+            "filter_type": "biquad",
             "cutoff_hz": 12.0,
-            "filter_order": 2,
+            "biquad_q": 0.707,
             "spectrum_mode": "psd",
         },
     )
@@ -174,7 +175,7 @@ def test_build_axis_analysis_processor_returns_expected_series() -> None:
     assert result.series["filtered"].y.size == values.size
     assert result.series["raw_spectrum"].x.size >= 1
     assert result.status_text is not None
-    assert "cutoff: 12.00 Hz" in result.status_text
+    assert "biquad: cutoff 12.00 Hz" in result.status_text
 
 
 def test_build_axis_analysis_processor_reports_cutoff_clamp() -> None:
@@ -203,8 +204,9 @@ def test_build_axis_analysis_processor_reports_cutoff_clamp() -> None:
     result = processor(
         analysis_input,
         {
+            "filter_type": "biquad",
             "cutoff_hz": 80.0,
-            "filter_order": 2,
+            "biquad_q": 0.707,
             "spectrum_mode": "fft",
         },
     )
@@ -246,12 +248,12 @@ def test_build_multi_axis_analysis_processor_uses_independent_filters() -> None:
     result = processor(
         analysis_input,
         {
-            "acc_x_filter_type": "lowpass",
+            "acc_x_filter_type": "biquad",
             "acc_x_cutoff_hz": 10.0,
-            "acc_x_filter_order": 2,
-            "gyro_z_filter_type": "lowpass",
+            "acc_x_biquad_q": 0.707,
+            "gyro_z_filter_type": "biquad",
             "gyro_z_cutoff_hz": 40.0,
-            "gyro_z_filter_order": 4,
+            "gyro_z_biquad_q": 0.707,
             "spectrum_mode": "psd",
         },
     )
@@ -285,8 +287,8 @@ def test_build_multi_axis_analysis_processor_uses_independent_filters() -> None:
         abs=1e-14,
     )
     assert result.status_text is not None
-    assert "acc_x: lowpass, cutoff 10.00 Hz, order 2" in result.status_text
-    assert "gyro_z: lowpass, cutoff 40.00 Hz, order 4" in result.status_text
+    assert "acc_x: biquad, cutoff 10.00 Hz, Q=0.707" in result.status_text
+    assert "gyro_z: biquad, cutoff 40.00 Hz, Q=0.707" in result.status_text
 
 
 def test_build_multi_axis_analysis_processor_adds_mahony_rpy_series() -> None:
@@ -342,7 +344,7 @@ def test_build_multi_axis_analysis_processor_adds_mahony_rpy_series() -> None:
         for suffix, value in (
             ("filter_type", "none"),
             ("cutoff_hz", 10.0),
-            ("filter_order", 2),
+            ("biquad_q", 0.707),
         )
     }
     params["spectrum_mode"] = "psd"
@@ -433,9 +435,9 @@ def test_build_multi_axis_analysis_processor_feeds_filtered_data_to_mahony(
         f"{axis}_{suffix}": value
         for axis in ("acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z")
         for suffix, value in (
-            ("filter_type", "lowpass"),
+            ("filter_type", "biquad"),
             ("cutoff_hz", 5.0),
-            ("filter_order", 2),
+            ("biquad_q", 0.707),
         )
     }
     params["spectrum_mode"] = "psd"
@@ -478,7 +480,7 @@ def test_build_multi_axis_analysis_processor_skips_mahony_when_hidden(
         for suffix, value in (
             ("filter_type", "none"),
             ("cutoff_hz", 10.0),
-            ("filter_order", 2),
+            ("biquad_q", 0.707),
         )
     }
     params["spectrum_mode"] = "psd"
@@ -540,22 +542,22 @@ def test_build_analysis_exposes_live_tunable_parameters(
     assert [parameter.name for parameter in app.parameters] == [
         "acc_x_filter_type",
         "acc_x_cutoff_hz",
-        "acc_x_filter_order",
+        "acc_x_biquad_q",
         "acc_y_filter_type",
         "acc_y_cutoff_hz",
-        "acc_y_filter_order",
+        "acc_y_biquad_q",
         "acc_z_filter_type",
         "acc_z_cutoff_hz",
-        "acc_z_filter_order",
+        "acc_z_biquad_q",
         "gyro_x_filter_type",
         "gyro_x_cutoff_hz",
-        "gyro_x_filter_order",
+        "gyro_x_biquad_q",
         "gyro_y_filter_type",
         "gyro_y_cutoff_hz",
-        "gyro_y_filter_order",
+        "gyro_y_biquad_q",
         "gyro_z_filter_type",
         "gyro_z_cutoff_hz",
-        "gyro_z_filter_order",
+        "gyro_z_biquad_q",
         "spectrum_mode",
     ]
     assert app.theme == "light"
