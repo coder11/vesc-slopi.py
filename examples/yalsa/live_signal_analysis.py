@@ -76,8 +76,8 @@ DEFAULT_PLOT_RATE = 60.0
 DEFAULT_WORKER_DRAIN_STRIDE = 2
 DEFAULT_PENDING_SAMPLES = 20_000
 DEFAULT_DETERMINISTIC_RATE = 500.0
-# DEFAULT_VESC_POLL_RATE = 1000
-DEFAULT_VESC_POLL_RATE = None
+DEFAULT_VESC_POLL_RATE = 1000
+# DEFAULT_VESC_POLL_RATE = None
 DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
@@ -328,9 +328,7 @@ class PendingSignalBatchBuffer:
             empty = np.empty(0, dtype=np.float64)
             return SignalBatch(
                 timestamps_s=empty,
-                values={
-                    channel_name: empty for channel_name in self._channel_names
-                },
+                values={channel_name: empty for channel_name in self._channel_names},
                 units=self._channels,
             )
         read_index = self._read_index

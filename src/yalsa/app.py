@@ -10,6 +10,7 @@ import struct
 import sys
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from itertools import cycle
@@ -34,6 +35,8 @@ _SHARED_CONFIG_BYTES = 1 * 1024 * 1024
 _SHARED_CONTROL_BYTES = 1 * 1024 * 1024
 _SHARED_STATE_BYTES = 32 * 1024 * 1024
 _SUPERVISOR_POLL_S = 0.2
+# Rolling window for smoothing measured VESC poll rate in the GUI (not the poll loop).
+_VESC_POLL_RATE_DISPLAY_SMA_WINDOW = 16
 _PROCESS_STOP_TIMEOUT_S = 2.0
 _SHARED_SLOT_MAGIC = b"YALSA001"
 _SHARED_SLOT_HEADER = struct.Struct("<8sQQQQ")
@@ -1191,6 +1194,25 @@ def _format_rate(value: float | None) -> str:
     return "measuring" if value is None else f"{value:.1f} Hz"
 
 
+class _VescPollRateDisplaySma:
+    """Rolling SMA for the measured rate shown in the GUI when ``rate_label`` is VESC poll rate."""
+
+    __slots__ = ("_buf",)
+
+    def __init__(self, *, window: int = _VESC_POLL_RATE_DISPLAY_SMA_WINDOW) -> None:
+        self._buf: deque[float] = deque(maxlen=max(1, window))
+
+    def reset(self) -> None:
+        self._buf.clear()
+
+    def smooth(self, raw_hz: float, *, rate_label: str) -> float:
+        if rate_label != "VESC poll rate":
+            self._buf.clear()
+            return raw_hz
+        self._buf.append(raw_hz)
+        return sum(self._buf) / len(self._buf)
+
+
 def _configure_plot_interaction(plot_item: Any, plot_spec: PlotSpec) -> None:
     view_box = plot_item.getViewBox()
     mouse_mode = view_box.PanMode
@@ -1305,11 +1327,20 @@ def _signal_status_lines(
     return lines
 
 
-def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
+def _debug_status_lines(
+    worker_snapshot: _AnalysisWorkerSnapshot,
+    *,
+    display_rate_hz: float | None = None,
+) -> list[str]:
     src_stats = worker_snapshot.source_stats
+    rate_hz = (
+        src_stats.average_rate_hz
+        if display_rate_hz is None
+        else display_rate_hz
+    )
     rate_label = src_stats.rate_label[:1].lower() + src_stats.rate_label[1:]
     lines = [
-        f"{rate_label}: {_format_rate(src_stats.average_rate_hz)}",
+        f"{rate_label}: {_format_rate(rate_hz)}",
         f"history: {_format_rate(worker_snapshot.history_rate_hz)}",
         f"samples: {src_stats.samples}",
         f"dropped: {src_stats.dropped}",
@@ -1322,11 +1353,20 @@ def _debug_status_lines(worker_snapshot: _AnalysisWorkerSnapshot) -> list[str]:
     return lines
 
 
-def _debug_toggle_text(worker_snapshot: _AnalysisWorkerSnapshot | None) -> str:
+def _debug_toggle_text(
+    worker_snapshot: _AnalysisWorkerSnapshot | None,
+    *,
+    display_rate_hz: float | None = None,
+) -> str:
     if worker_snapshot is None:
         return "Data acquisition rate: measuring"
     src_stats = worker_snapshot.source_stats
-    source_rate = _format_rate(src_stats.average_rate_hz)
+    rate_hz = (
+        src_stats.average_rate_hz
+        if display_rate_hz is None
+        else display_rate_hz
+    )
+    source_rate = _format_rate(rate_hz)
     return f"{src_stats.rate_label}: {source_rate}"
 
 
@@ -1632,6 +1672,8 @@ def _run_live_analysis_gui(
         plot_items.append(plot_item)
         plot_curves.append(curves)
 
+    poll_rate_display_sma = _VescPollRateDisplaySma()
+
     rendered_state_version: int | None = None
 
     def refresh() -> None:
@@ -1690,12 +1732,24 @@ def _run_live_analysis_gui(
         signal_status.setText(
             "\n".join(_signal_status_lines(worker_snapshot, config.channels))
         )
-        debug_summary.setText(_debug_toggle_text(worker_snapshot))
-        debug_status.setText("\n".join(_debug_status_lines(worker_snapshot)))
+        src_stats = worker_snapshot.source_stats
+        display_rate_hz = poll_rate_display_sma.smooth(
+            src_stats.average_rate_hz,
+            rate_label=src_stats.rate_label,
+        )
+        debug_summary.setText(
+            _debug_toggle_text(worker_snapshot, display_rate_hz=display_rate_hz)
+        )
+        debug_status.setText(
+            "\n".join(
+                _debug_status_lines(worker_snapshot, display_rate_hz=display_rate_hz)
+            )
+        )
 
     def clear_history() -> None:
         nonlocal rendered_state_version
         rendered_state_version = None
+        poll_rate_display_sma.reset()
 
         def update(control: _LiveAnalysisControl) -> _LiveAnalysisControl:
             return _LiveAnalysisControl(

@@ -287,6 +287,20 @@ def test_live_analysis_status_lines_include_signal_and_source_data() -> None:
     assert yalsa_app._debug_toggle_text(None) == "Data acquisition rate: measuring"
 
 
+def test_vesc_poll_rate_display_sma_smooths_only_vesc_label() -> None:
+    sma = yalsa_app._VescPollRateDisplaySma(window=4)
+    assert sma.smooth(100.0, rate_label="Data acquisition rate") == pytest.approx(100.0)
+    assert sma.smooth(200.0, rate_label="VESC poll rate") == pytest.approx(200.0)
+    assert sma.smooth(400.0, rate_label="VESC poll rate") == pytest.approx(300.0)
+    assert sma.smooth(400.0, rate_label="VESC poll rate") == pytest.approx(
+        (200.0 + 400.0 + 400.0) / 3.0
+    )
+    assert sma.smooth(80.0, rate_label="Data acquisition rate") == pytest.approx(80.0)
+    assert sma.smooth(120.0, rate_label="VESC poll rate") == pytest.approx(120.0)
+    sma.reset()
+    assert sma.smooth(50.0, rate_label="VESC poll rate") == pytest.approx(50.0)
+
+
 def test_qt_theme_stylesheet_forces_light_widget_palette() -> None:
     stylesheet = yalsa_app._qt_theme_stylesheet(yalsa_app.PLOT_THEMES["light"])
 
