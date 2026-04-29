@@ -53,7 +53,7 @@ from yalsa import (
     xy_series,
 )
 
-DEFAULT_HISTORY = 20_000
+DEFAULT_HISTORY = 5_000
 DEFAULT_MAX_POINTS = 1_200
 DEFAULT_PLOT_RATE = 30.0
 DEFAULT_PENDING_SAMPLES = 20_000
@@ -64,6 +64,8 @@ DEFAULT_CUTOFF_HZ = 15.0
 DEFAULT_FILTER_ORDER = 2
 DEFAULT_THEME: Literal["light", "dark"] = "light"
 DEFAULT_SOURCE = "vesc"
+RAW_TRACE_COLOR = "#afafaf"
+FILTERED_TRACE_COLOR = "#1f77b4"
 SOURCE_CHOICES = (
     DEFAULT_SOURCE,
     "deterministic",
@@ -267,8 +269,12 @@ def build_analysis(
             PlotSpec(
                 title="Time Domain",
                 traces=(
-                    PlotTrace(series="raw", label="Raw"),
-                    PlotTrace(series="filtered", label="Filtered"),
+                    PlotTrace(series="raw", label="Raw", color=RAW_TRACE_COLOR),
+                    PlotTrace(
+                        series="filtered",
+                        label="Filtered",
+                        color=FILTERED_TRACE_COLOR,
+                    ),
                 ),
                 x_label="time",
                 x_unit="s",
@@ -286,8 +292,16 @@ def build_analysis(
             PlotSpec(
                 title="Frequency Domain",
                 traces=(
-                    PlotTrace(series="raw_spectrum", label="Raw"),
-                    PlotTrace(series="filtered_spectrum", label="Filtered"),
+                    PlotTrace(
+                        series="raw_spectrum",
+                        label="Raw",
+                        color=RAW_TRACE_COLOR,
+                    ),
+                    PlotTrace(
+                        series="filtered_spectrum",
+                        label="Filtered",
+                        color=FILTERED_TRACE_COLOR,
+                    ),
                 ),
                 x_label="frequency",
                 x_unit="Hz",
