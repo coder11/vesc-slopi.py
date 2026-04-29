@@ -825,7 +825,8 @@ class VescImuBatchSignalSource:
                     if not _wait_until_ns(next_request_ns, self._stop):
                         break
 
-                previous_request_ns = time.perf_counter_ns()
+                request_ns = time.perf_counter_ns()
+                previous_request_ns = request_ns
                 serial_port.write(self._request)
 
                 payload = _read_expected_imu_packet(
@@ -847,7 +848,7 @@ class VescImuBatchSignalSource:
                         self._last_error = str(exc)
                     continue
 
-                sample_s = (now_ns - self._start_ns) / NSEC_PER_SEC
+                sample_s = (request_ns - self._start_ns) / NSEC_PER_SEC
                 pending_timestamps.append(sample_s)
                 for axis, value in values.items():
                     pending_values[axis].append(value)

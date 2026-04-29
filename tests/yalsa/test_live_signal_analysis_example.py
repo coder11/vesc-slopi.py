@@ -79,6 +79,87 @@ def test_vesc_source_stats_average_rate_matches_pending_ring_timestamps() -> Non
     assert stats.average_rate_hz == pytest.approx(100.0)
 
 
+def test_vesc_batch_source_timestamps_samples_at_request_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock_ns = 1_000_000_000
+    request_times_ns: list[int] = []
+    response_latencies_ns = [200_000, 1_400_000, 100_000]
+
+    class FakeSerial:
+        def write(self, _data: bytes) -> None:
+            request_times_ns.append(clock_ns)
+
+        def reset_input_buffer(self) -> None:
+            return None
+
+        def close(self) -> None:
+            return None
+
+    class FakeImuData:
+        def axis_values(self, axes: tuple[str, ...]) -> dict[str, float]:
+            return {axis: float(index + 1) for index, axis in enumerate(axes)}
+
+    fake_serial = FakeSerial()
+    source = live_signal_analysis.VescImuBatchSignalSource(
+        connection=VescConnection.serial("/dev/null"),
+        axes=("acc_x", "acc_y"),
+        timeout=0.1,
+        pending_samples=64,
+        poll_rate_hz=None,
+    )
+
+    def fake_open_blocking_io(
+        connection: VescConnection,
+        *,
+        timeout: float,
+    ) -> FakeSerial:
+        assert connection == VescConnection.serial("/dev/null")
+        assert timeout == pytest.approx(0.1)
+        return fake_serial
+
+    def fake_read_expected_imu_packet(
+        serial_port: FakeSerial,
+        packet_timeout: float,
+        stats: object,
+    ) -> bytes:
+        nonlocal clock_ns
+        assert serial_port is fake_serial
+        assert packet_timeout == pytest.approx(0.1)
+        assert stats is not None
+        clock_ns += response_latencies_ns[len(request_times_ns) - 1]
+        if len(request_times_ns) >= len(response_latencies_ns):
+            source._stop.set()
+        return b"payload"
+
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "open_blocking_io",
+        fake_open_blocking_io,
+    )
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "_read_expected_imu_packet",
+        fake_read_expected_imu_packet,
+    )
+    monkeypatch.setattr(
+        live_signal_analysis,
+        "imu_data_from_payload",
+        lambda _payload: FakeImuData(),
+    )
+    monkeypatch.setattr(
+        live_signal_analysis.time,
+        "perf_counter_ns",
+        lambda: clock_ns,
+    )
+
+    source._run()
+
+    batch, _stats = source.drain()
+    assert request_times_ns == [1_000_000_000, 1_000_200_000, 1_001_600_000]
+    assert batch.timestamps_s.tolist() == pytest.approx([0.0, 0.0002, 0.0016])
+
+
 def test_make_source_passes_vesc_poll_rate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
