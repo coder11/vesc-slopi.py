@@ -42,11 +42,13 @@ DEFAULT_MAX_POINTS = 2_000
 DEFAULT_PLOT_RATE = 60.0
 DEFAULT_WORKER_DRAIN_STRIDE = 1
 DEFAULT_PENDING_SAMPLES = 20_000
-DEFAULT_VESC_POLL_RATE = 100.0
+DEFAULT_VESC_POLL_RATE = 500.0
 # DEFAULT_VESC_POLL_RATE = None
 DEFAULT_TIMEOUT = 0.1
 DEFAULT_AXIS = "acc_z"
 RESPONSE_LATENCY_CHANNEL = "response_latency"
+REQUEST_LATENESS_CHANNEL = "request_lateness"
+MISSED_SLOTS_CHANNEL = "missed_slots"
 
 # Edit these values directly instead of passing example-specific CLI flags.
 RUN_AXIS = DEFAULT_AXIS
@@ -92,6 +94,8 @@ def build_timestamp_index_processor() -> ProcessCallback:
     ) -> AnalysisResult:
         timestamps = data.timestamps_s
         response_latency_s = data.channel(RESPONSE_LATENCY_CHANNEL)
+        request_lateness_s = data.channel(REQUEST_LATENESS_CHANNEL)
+        missed_slots = data.channel(MISSED_SLOTS_CHANNEL)
         sample_indexes = np.arange(timestamps.size, dtype=np.float64)
         lag_s = np.diff(timestamps)
         lag_sample_indexes = np.arange(1, timestamps.size, dtype=np.float64)
@@ -104,11 +108,19 @@ def build_timestamp_index_processor() -> ProcessCallback:
             latency_text = "latency measuring"
             if int(response_latency_s.size) > 0:
                 latency_text = f"latest latency: {response_latency_s[-1]:.6f} s"
+            lateness_text = "lateness measuring"
+            if int(request_lateness_s.size) > 0:
+                lateness_text = f"latest lateness: {request_lateness_s[-1]:.6f} s"
+            missed_text = "missed slots measuring"
+            if int(missed_slots.size) > 0:
+                missed_text = f"latest missed slots: {missed_slots[-1]:.0f}"
             status_text = (
                 f"samples: {timestamps.size} | "
                 f"latest timestamp: {timestamps[-1]:.6f} s | "
                 f"{lag_text} | "
-                f"{latency_text}"
+                f"{latency_text} | "
+                f"{lateness_text} | "
+                f"{missed_text}"
             )
 
         return AnalysisResult(
@@ -116,6 +128,8 @@ def build_timestamp_index_processor() -> ProcessCallback:
                 "timestamp": xy_series(sample_indexes, timestamps),
                 "sample_lag": xy_series(lag_sample_indexes, lag_s),
                 "response_latency": xy_series(sample_indexes, response_latency_s),
+                "request_lateness": xy_series(sample_indexes, request_lateness_s),
+                "missed_slots": xy_series(sample_indexes, missed_slots),
             },
             status_text=status_text,
         )
@@ -176,6 +190,44 @@ def build_analysis(
                 mouse_mode="rect",
             ),
             PlotSpec(
+                title="Request Lateness",
+                traces=(
+                    PlotTrace(
+                        series="request_lateness",
+                        label="request lateness",
+                        color="#9467bd",
+                    ),
+                ),
+                x_label="sample index",
+                y_label="lateness",
+                y_unit="s",
+                max_points=DEFAULT_MAX_POINTS,
+                auto_range_x=True,
+                auto_range_y=True,
+                allow_mouse_x=True,
+                allow_mouse_y=True,
+                mouse_mode="rect",
+            ),
+            PlotSpec(
+                title="Missed Poll Slots",
+                traces=(
+                    PlotTrace(
+                        series="missed_slots",
+                        label="missed slots",
+                        color="#ff7f0e",
+                    ),
+                ),
+                x_label="sample index",
+                y_label="slots",
+                y_unit="",
+                max_points=DEFAULT_MAX_POINTS,
+                auto_range_x=True,
+                auto_range_y=True,
+                allow_mouse_x=True,
+                allow_mouse_y=True,
+                mouse_mode="rect",
+            ),
+            PlotSpec(
                 title="Timestamp Over Sample Index",
                 traces=(
                     PlotTrace(
@@ -207,6 +259,8 @@ class VescImuTimestampBatchSource:
         self._channels = {
             source.channel_name: source.unit,
             source.response_latency_channel_name: source.response_latency_unit,
+            source.request_lateness_channel_name: source.request_lateness_unit,
+            source.missed_slots_channel_name: source.missed_slots_unit,
         }
 
     @property
@@ -220,34 +274,42 @@ class VescImuTimestampBatchSource:
         self._source.stop(timeout=timeout)
 
     def drain(self) -> tuple[SignalBatch, SignalBatchSourceStats]:
-        timestamps, values, latencies, stats = (
-            self._source.drain_with_response_latency()
+        timestamps, values, latencies, latenesses, missed_slots, stats = (
+            self._source.drain_with_timing()
         )
-        timestamps, values, latencies = _align_drained_arrays(
+        timestamps, values, latencies, latenesses, missed_slots = _align_drained_arrays(
             timestamps,
             values,
             latencies,
+            latenesses,
+            missed_slots,
         )
         batch = SignalBatch(
             timestamps_s=timestamps,
             values={
                 self._source.channel_name: values,
                 self._source.response_latency_channel_name: latencies,
+                self._source.request_lateness_channel_name: latenesses,
+                self._source.missed_slots_channel_name: missed_slots,
             },
             units=self._channels,
         )
-        return batch, self._batch_stats(stats, latencies)
+        return batch, self._batch_stats(stats, latencies, latenesses, missed_slots)
 
     def source_stats(self) -> SignalBatchSourceStats:
         return self._batch_stats(
             self._source.source_stats(),
             _latest_latency_array(self._source),
+            _latest_lateness_array(self._source),
+            _latest_missed_slots_array(self._source),
         )
 
     def _batch_stats(
         self,
         stats: SignalSourceStats,
         latencies: npt.NDArray[np.float64],
+        latenesses: npt.NDArray[np.float64],
+        missed_slots: npt.NDArray[np.float64],
     ) -> SignalBatchSourceStats:
         latest_values: dict[str, float] = {}
         if stats.latest_value is not None:
@@ -255,6 +317,14 @@ class VescImuTimestampBatchSource:
         if int(latencies.size) > 0:
             latest_values[self._source.response_latency_channel_name] = float(
                 latencies[-1]
+            )
+        if int(latenesses.size) > 0:
+            latest_values[self._source.request_lateness_channel_name] = float(
+                latenesses[-1]
+            )
+        if int(missed_slots.size) > 0:
+            latest_values[self._source.missed_slots_channel_name] = float(
+                missed_slots[-1]
             )
         return SignalBatchSourceStats(
             samples=stats.samples,
@@ -273,21 +343,64 @@ def _align_drained_arrays(
     timestamps: npt.NDArray[np.float64],
     values: npt.NDArray[np.float64],
     latencies: npt.NDArray[np.float64],
+    latenesses: npt.NDArray[np.float64],
+    missed_slots: npt.NDArray[np.float64],
 ) -> tuple[
     npt.NDArray[np.float64],
     npt.NDArray[np.float64],
     npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
 ]:
-    count = min(int(timestamps.size), int(values.size), int(latencies.size))
-    if count == int(timestamps.size) == int(values.size) == int(latencies.size):
-        return timestamps, values, latencies
+    count = min(
+        int(timestamps.size),
+        int(values.size),
+        int(latencies.size),
+        int(latenesses.size),
+        int(missed_slots.size),
+    )
+    if (
+        count
+        == int(timestamps.size)
+        == int(values.size)
+        == int(latencies.size)
+        == int(latenesses.size)
+        == int(missed_slots.size)
+    ):
+        return timestamps, values, latencies, latenesses, missed_slots
     if count == 0:
-        return _empty_array(), _empty_array(), _empty_array()
-    return timestamps[-count:], values[-count:], latencies[-count:]
+        return (
+            _empty_array(),
+            _empty_array(),
+            _empty_array(),
+            _empty_array(),
+            _empty_array(),
+        )
+    return (
+        timestamps[-count:],
+        values[-count:],
+        latencies[-count:],
+        latenesses[-count:],
+        missed_slots[-count:],
+    )
 
 
 def _latest_latency_array(source: VescImuSignalSource) -> npt.NDArray[np.float64]:
     stats = source.response_latency_stats()
+    if stats.latest_value is None:
+        return _empty_array()
+    return np.asarray((stats.latest_value,), dtype=np.float64)
+
+
+def _latest_lateness_array(source: VescImuSignalSource) -> npt.NDArray[np.float64]:
+    stats = source.request_lateness_stats()
+    if stats.latest_value is None:
+        return _empty_array()
+    return np.asarray((stats.latest_value,), dtype=np.float64)
+
+
+def _latest_missed_slots_array(source: VescImuSignalSource) -> npt.NDArray[np.float64]:
+    stats = source.missed_slots_stats()
     if stats.latest_value is None:
         return _empty_array()
     return np.asarray((stats.latest_value,), dtype=np.float64)

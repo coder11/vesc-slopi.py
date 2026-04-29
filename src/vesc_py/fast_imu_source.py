@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import queue
 import threading
 import time
 from collections.abc import Sequence
@@ -63,7 +64,9 @@ _IMU_AXIS_UNITS = {
     "gyro_y": "deg/s",
     "gyro_z": "deg/s",
 }
-_RATE_LIMIT_SLEEP_SLACK_NS = 200_000
+_RATE_LIMIT_SLEEP_SLACK_NS = 1_000_000
+_SAMPLE_PUBLISH_INTERVAL_NS = 20_000_000
+_SAMPLE_PUBLISH_BATCH_SIZE = 64
 
 
 @dataclass(slots=True)
@@ -132,6 +135,15 @@ class ImuData:
                 f"{joined}"
             )
         return {axis: self.axis_value(axis) for axis in parsed_axes}
+
+
+@dataclass(frozen=True, slots=True)
+class _QueuedImuSample:
+    timestamp_s: float
+    value: float
+    response_latency_s: float
+    request_lateness_s: float
+    missed_slots: float
 
 
 def parse_imu_axis(text: str) -> str:
@@ -348,6 +360,24 @@ def _wait_until_ns(deadline_ns: int, stop: threading.Event) -> bool:
     return False
 
 
+def _next_scheduled_request(
+    previous_scheduled_request_ns: int | None,
+    *,
+    start_ns: int,
+    poll_interval_ns: int,
+    now_ns: int,
+) -> tuple[int, int]:
+    if previous_scheduled_request_ns is None:
+        return start_ns, 0
+
+    scheduled_request_ns = previous_scheduled_request_ns + poll_interval_ns
+    missed_slots = 0
+    if scheduled_request_ns < now_ns:
+        missed_slots = (now_ns - scheduled_request_ns) // poll_interval_ns + 1
+        scheduled_request_ns += missed_slots * poll_interval_ns
+    return scheduled_request_ns, missed_slots
+
+
 class VescImuSignalSource:
     """SignalSource implementation backed by direct VESC transport IMU polling."""
 
@@ -373,20 +403,23 @@ class VescImuSignalSource:
         self._timeout = timeout
         self._poll_rate_hz = poll_rate_hz
         self._poll_interval_ns = (
-            None
-            if poll_rate_hz is None
-            else max(1, round(NSEC_PER_SEC / poll_rate_hz))
+            None if poll_rate_hz is None else max(1, round(NSEC_PER_SEC / poll_rate_hz))
         )
         self._can_id = can_id
         self._mask = imu_axes_mask((self._axis,))
         self._request = build_imu_request(self._mask, can_id=can_id)
         self._samples = PendingSignalBuffer(pending_samples)
         self._response_latencies = PendingSignalBuffer(pending_samples)
+        self._request_latenesses = PendingSignalBuffer(pending_samples)
+        self._missed_slots = PendingSignalBuffer(pending_samples)
+        self._sample_queue: queue.SimpleQueue[_QueuedImuSample] = queue.SimpleQueue()
         self._stats = ImuSourceStats()
         self._lock = threading.Lock()
+        self._publish_lock = threading.Lock()
         self._stop = threading.Event()
         self._done = threading.Event()
         self._thread: threading.Thread | None = None
+        self._publish_thread: threading.Thread | None = None
         self._serial_port: BlockingIo | None = None
         self._start_ns = 0
         self._last_error: str | None = None
@@ -407,11 +440,33 @@ class VescImuSignalSource:
     def response_latency_unit(self) -> str:
         return "s"
 
+    @property
+    def request_lateness_channel_name(self) -> str:
+        return "request_lateness"
+
+    @property
+    def request_lateness_unit(self) -> str:
+        return "s"
+
+    @property
+    def missed_slots_channel_name(self) -> str:
+        return "missed_slots"
+
+    @property
+    def missed_slots_unit(self) -> str:
+        return "slots"
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
         self._stop.clear()
         self._done.clear()
+        self._publish_thread = threading.Thread(
+            target=self._publish_samples,
+            name="vesc-imu-signal-publisher",
+            daemon=True,
+        )
+        self._publish_thread.start()
         self._thread = threading.Thread(
             target=self._run,
             name="vesc-imu-signal-source",
@@ -423,6 +478,8 @@ class VescImuSignalSource:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        if self._publish_thread is not None:
+            self._publish_thread.join(timeout=timeout)
         if self._serial_port is not None:
             self._serial_port.close()
             self._serial_port = None
@@ -430,7 +487,9 @@ class VescImuSignalSource:
     def drain(
         self,
     ) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], SignalSourceStats]:
-        timestamps, values, _latencies, stats = self._drain_with_response_latency()
+        timestamps, values, _latencies, _latenesses, _missed, stats = (
+            self.drain_with_timing()
+        )
         return timestamps, values, stats
 
     def drain_with_response_latency(
@@ -442,20 +501,33 @@ class VescImuSignalSource:
         SignalSourceStats,
     ]:
         """Drain IMU samples with request-to-response latency for each sample."""
-        return self._drain_with_response_latency()
+        timestamps, values, latencies, _latenesses, _missed, stats = (
+            self.drain_with_timing()
+        )
+        return timestamps, values, latencies, stats
 
-    def _drain_with_response_latency(
+    def drain_with_timing(
         self,
     ) -> tuple[
         npt.NDArray[np.float64],
         npt.NDArray[np.float64],
         npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
+        npt.NDArray[np.float64],
         SignalSourceStats,
     ]:
-        timestamps, values, _dropped_interval, buf_stats = self._samples.drain()
-        _latency_timestamps, latencies, _latency_dropped, _latency_stats = (
-            self._response_latencies.drain()
-        )
+        """Drain IMU samples with response latency, request lateness, and skips."""
+        with self._publish_lock:
+            timestamps, values, _dropped_interval, buf_stats = self._samples.drain()
+            _latency_timestamps, latencies, _latency_dropped, _latency_stats = (
+                self._response_latencies.drain()
+            )
+            _lateness_timestamps, latenesses, _lateness_dropped, _lateness_stats = (
+                self._request_latenesses.drain()
+            )
+            _missed_timestamps, missed_slots, _missed_dropped, _missed_stats = (
+                self._missed_slots.drain()
+            )
         with self._lock:
             stats = SignalSourceStats(
                 samples=buf_stats.sample_count,
@@ -467,7 +539,7 @@ class VescImuSignalSource:
                 last_error=self._last_error,
                 done=self._done.is_set(),
             )
-        return timestamps, values, latencies, stats
+        return timestamps, values, latencies, latenesses, missed_slots, stats
 
     def source_stats(self) -> SignalSourceStats:
         buf_stats = self._samples.pending_stats()
@@ -497,35 +569,125 @@ class VescImuSignalSource:
                 done=self._done.is_set(),
             )
 
+    def request_lateness_stats(self) -> SignalSourceStats:
+        buf_stats = self._request_latenesses.pending_stats()
+        with self._lock:
+            return SignalSourceStats(
+                samples=buf_stats.sample_count,
+                dropped=buf_stats.cumulative_dropped,
+                errors=self._stats.errors,
+                average_rate_hz=buf_stats.average_rate_hz,
+                latest_sample_s=buf_stats.latest_sample_s,
+                latest_value=buf_stats.latest_value,
+                last_error=self._last_error,
+                done=self._done.is_set(),
+            )
+
+    def missed_slots_stats(self) -> SignalSourceStats:
+        buf_stats = self._missed_slots.pending_stats()
+        with self._lock:
+            return SignalSourceStats(
+                samples=buf_stats.sample_count,
+                dropped=buf_stats.cumulative_dropped,
+                errors=self._stats.errors,
+                average_rate_hz=buf_stats.average_rate_hz,
+                latest_sample_s=buf_stats.latest_sample_s,
+                latest_value=buf_stats.latest_value,
+                last_error=self._last_error,
+                done=self._done.is_set(),
+            )
+
     def _value_from_payload(self, payload: bytes) -> float:
         return imu_values_from_payload(payload, (self._axis,))[self._axis]
 
+    def _enqueue_sample(
+        self,
+        *,
+        timestamp_s: float,
+        value: float,
+        response_latency_s: float,
+        request_lateness_s: float,
+        missed_slots: int,
+    ) -> None:
+        self._sample_queue.put(
+            _QueuedImuSample(
+                timestamp_s=timestamp_s,
+                value=value,
+                response_latency_s=response_latency_s,
+                request_lateness_s=request_lateness_s,
+                missed_slots=float(missed_slots),
+            )
+        )
+
+    def _flush_sample_queue(self, max_samples: int | None = None) -> int:
+        timestamps: list[float] = []
+        values: list[float] = []
+        response_latencies: list[float] = []
+        request_latenesses: list[float] = []
+        missed_slots: list[float] = []
+        while max_samples is None or len(timestamps) < max_samples:
+            try:
+                sample = self._sample_queue.get_nowait()
+            except queue.Empty:
+                break
+            timestamps.append(sample.timestamp_s)
+            values.append(sample.value)
+            response_latencies.append(sample.response_latency_s)
+            request_latenesses.append(sample.request_lateness_s)
+            missed_slots.append(sample.missed_slots)
+
+        if not timestamps:
+            return 0
+
+        with self._publish_lock:
+            self._samples.append_many(timestamps, values)
+            self._response_latencies.append_many(timestamps, response_latencies)
+            self._request_latenesses.append_many(timestamps, request_latenesses)
+            self._missed_slots.append_many(timestamps, missed_slots)
+        return len(timestamps)
+
+    def _publish_samples(self) -> None:
+        while not self._done.is_set() or not self._sample_queue.empty():
+            flushed = self._flush_sample_queue(_SAMPLE_PUBLISH_BATCH_SIZE)
+            if flushed >= _SAMPLE_PUBLISH_BATCH_SIZE:
+                continue
+            if self._done.wait(_SAMPLE_PUBLISH_INTERVAL_NS / NSEC_PER_SEC):
+                continue
+            if self._stop.is_set() and self._sample_queue.empty():
+                break
+        self._flush_sample_queue()
+
     def _run(self) -> None:
-        self._start_ns = time.perf_counter_ns()
-        pending_timestamps: list[float] = []
-        pending_values: list[float] = []
-        pending_response_latencies: list[float] = []
-        next_flush_ns = self._start_ns + 5_000_000
-        previous_request_ns: int | None = None
+        scheduled_request_ns: int | None = None
+        missed_slots = 0
         try:
             self._serial_port = open_blocking_io(
                 self._connection,
                 timeout=self._timeout,
             )
+            self._start_ns = time.perf_counter_ns()
             while not self._stop.is_set():
                 serial_port = self._serial_port
                 if serial_port is None:
                     break
 
-                if (
-                    self._poll_interval_ns is not None
-                    and previous_request_ns is not None
-                ):
-                    next_request_ns = previous_request_ns + self._poll_interval_ns
-                    if not _wait_until_ns(next_request_ns, self._stop):
+                if self._poll_interval_ns is not None:
+                    scheduled_request_ns, missed_slots = _next_scheduled_request(
+                        scheduled_request_ns,
+                        start_ns=self._start_ns,
+                        poll_interval_ns=self._poll_interval_ns,
+                        now_ns=time.perf_counter_ns(),
+                    )
+                    if not _wait_until_ns(scheduled_request_ns, self._stop):
                         break
 
-                previous_request_ns = time.perf_counter_ns()
+                request_ns = time.perf_counter_ns()
+                if scheduled_request_ns is None:
+                    scheduled_request_ns = request_ns
+                    missed_slots = 0
+                request_lateness_s = (
+                    request_ns - scheduled_request_ns
+                ) / NSEC_PER_SEC
                 serial_port.write(self._request)
 
                 payload = _read_expected_imu_packet(
@@ -534,7 +696,7 @@ class VescImuSignalSource:
                     self._stats,
                 )
                 now_ns = time.perf_counter_ns()
-                response_latency_s = (now_ns - previous_request_ns) / NSEC_PER_SEC
+                response_latency_s = (now_ns - request_ns) / NSEC_PER_SEC
                 if payload is None:
                     self._stats.timeouts += 1
                     serial_port.reset_input_buffer()
@@ -548,38 +710,27 @@ class VescImuSignalSource:
                         self._last_error = str(exc)
                     continue
 
-                sample_s = (previous_request_ns - self._start_ns) / NSEC_PER_SEC
-                pending_timestamps.append(sample_s)
-                pending_values.append(value)
-                pending_response_latencies.append(response_latency_s)
+                sample_s = (scheduled_request_ns - self._start_ns) / NSEC_PER_SEC
+                self._enqueue_sample(
+                    timestamp_s=sample_s,
+                    value=value,
+                    response_latency_s=response_latency_s,
+                    request_lateness_s=request_lateness_s,
+                    missed_slots=missed_slots,
+                )
                 with self._lock:
                     self._last_error = None
-
-                if len(pending_timestamps) >= 64 or now_ns >= next_flush_ns:
-                    self._samples.append_many(pending_timestamps, pending_values)
-                    self._response_latencies.append_many(
-                        pending_timestamps,
-                        pending_response_latencies,
-                    )
-                    pending_timestamps.clear()
-                    pending_values.clear()
-                    pending_response_latencies.clear()
-                    next_flush_ns = now_ns + 5_000_000
         except Exception as exc:  # noqa: BLE001 - source errors are surfaced in status.
             with self._lock:
                 self._stats.parse_errors += 1
                 self._last_error = str(exc)
         finally:
-            if pending_timestamps:
-                self._samples.append_many(pending_timestamps, pending_values)
-                self._response_latencies.append_many(
-                    pending_timestamps,
-                    pending_response_latencies,
-                )
             if self._serial_port is not None:
                 self._serial_port.close()
                 self._serial_port = None
             self._done.set()
+            if self._publish_thread is None or not self._publish_thread.is_alive():
+                self._flush_sample_queue()
 
 
 __all__ = [
