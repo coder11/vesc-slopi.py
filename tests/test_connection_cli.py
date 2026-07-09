@@ -12,6 +12,7 @@ from vesc_py.connection_cli import (
     add_vesc_connection_arguments,
     parse_can_id_arg,
     run_vesc_connection_cli,
+    resolve_vesc_connection_from_args,
     resolve_vesc_target_from_args,
 )
 from vesc_py.models import BleDevice, FwVersion, VescSerialPort
@@ -42,6 +43,14 @@ class _FakeClient:
 
     def close(self) -> None:
         self.closed = True
+
+
+@pytest.fixture(autouse=True)
+def _isolated_state_home(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -81,6 +90,28 @@ def test_run_connection_cli_parses_args_and_returns_target() -> None:
     assert target.connection.kind is VescConnectionKind.SERIAL
     assert target.connection.address == "/dev/ttyACM0"
     assert target.can_id == 9
+
+
+def test_resolve_connection_uses_direct_args_without_can_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = argparse.ArgumentParser()
+    add_vesc_connection_arguments(parser, include_can_id=False)
+    args = parser.parse_args(["--serial", "/dev/ttyACM0"])
+
+    monkeypatch.setattr(
+        "vesc_py.connection_cli.connect_client",
+        lambda *args, **kwargs: pytest.fail("CAN scan should not run"),
+    )
+
+    connection = resolve_vesc_connection_from_args(
+        args,
+        input_stream=io.StringIO(),
+        output_stream=io.StringIO(),
+    )
+
+    assert connection.kind is VescConnectionKind.SERIAL
+    assert connection.address == "/dev/ttyACM0"
 
 
 def test_resolve_target_interactively_selects_ble_then_can(

@@ -110,7 +110,8 @@ class _CanTargetCandidate:
     label: str
 
 
-class _HasConnectionArgs(Protocol):
+# pylint: disable-next=too-few-public-methods
+class _HasDirectConnectionArgs(Protocol):
     serial: str | None
     ble: str | None
     force_discovery: bool
@@ -120,6 +121,10 @@ class _HasConnectionArgs(Protocol):
     ble_scan_timeout: float
     ble_connect_timeout: float
     ble_chunk_size: int
+
+
+# pylint: disable-next=too-few-public-methods
+class _HasConnectionArgs(_HasDirectConnectionArgs, Protocol):
     can_id: int | None
 
 
@@ -131,7 +136,7 @@ def resolve_vesc_target_from_args(
     output_stream: TextIO = sys.stderr,
 ) -> VescTarget:
     """Resolve a direct connection and optional CAN target from parsed args."""
-    connection = _resolve_connection_from_args(
+    connection = resolve_vesc_connection_from_args(
         args,
         input_stream=input_stream,
         output_stream=output_stream,
@@ -143,8 +148,23 @@ def resolve_vesc_target_from_args(
         input_stream=input_stream,
         output_stream=output_stream,
     )
-    _save_cached_connection(connection)
     return VescTarget(connection=connection, can_id=can_id)
+
+
+def resolve_vesc_connection_from_args(
+    args: _HasDirectConnectionArgs,
+    *,
+    input_stream: TextIO = sys.stdin,
+    output_stream: TextIO = sys.stderr,
+) -> VescConnection:
+    """Resolve only the direct VESC connection from parsed CLI arguments."""
+    connection = _resolve_connection_from_args(
+        args,
+        input_stream=input_stream,
+        output_stream=output_stream,
+    )
+    _save_cached_connection(connection)
+    return connection
 
 
 def run_vesc_connection_cli(
@@ -170,7 +190,7 @@ def run_vesc_connection_cli(
 
 
 def _resolve_connection_from_args(
-    args: _HasConnectionArgs,
+    args: _HasDirectConnectionArgs,
     *,
     input_stream: TextIO,
     output_stream: TextIO,
@@ -228,7 +248,7 @@ def _resolve_connection_from_args(
 
 
 def discover_connection_candidates(
-    args: _HasConnectionArgs,
+    args: _HasDirectConnectionArgs,
     *,
     output_stream: TextIO,
 ) -> list[_ConnectionCandidate]:
@@ -334,7 +354,7 @@ def _cache_file_path() -> Path:
     return state_dir / "vescpy" / "connection.json"
 
 
-def _load_cached_connection(args: _HasConnectionArgs) -> VescConnection | None:
+def _load_cached_connection(args: _HasDirectConnectionArgs) -> VescConnection | None:
     cache_file = _cache_file_path()
     try:
         payload = json.loads(cache_file.read_text(encoding="utf-8"))
@@ -381,7 +401,8 @@ def _can_connect(connection: VescConnection, *, timeout: float, output_stream: T
         client = connect_client(connection, timeout=timeout)
     except (ConnectionError, OSError, TimeoutError, ValueError) as exc:
         print(
-            f"Cached connection failed ({connection.describe()}): {exc}. Falling back to discovery.",
+            f"Cached connection failed ({connection.describe()}): {exc}. "
+            "Falling back to discovery.",
             file=output_stream,
         )
         return False
@@ -489,5 +510,6 @@ __all__ = [
     "discover_connection_candidates",
     "parse_can_id_arg",
     "run_vesc_connection_cli",
+    "resolve_vesc_connection_from_args",
     "resolve_vesc_target_from_args",
 ]

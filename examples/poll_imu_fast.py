@@ -323,9 +323,7 @@ def open_poll_connection(target: VescTarget, *, timeout: float) -> tuple[PollIo,
         )
 
     try:
-        return cast(
-            PollIo, open_blocking_io(connection, timeout=timeout)
-        ), connection.address
+        return open_blocking_io(connection, timeout=timeout), connection.address
     except TimeoutError:
         if connection.kind is VescConnectionKind.BLE:
             raise SystemExit(
