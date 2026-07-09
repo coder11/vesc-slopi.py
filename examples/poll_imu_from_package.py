@@ -20,14 +20,14 @@ import os
 import sys
 import time
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import numpy.typing as npt
 
-from vesc_py.connection import VescConnectionKind
+from vesc_py.connection import VescConnection, VescConnectionKind, connect_client
 from vesc_py.connection_cli import (
     add_vesc_connection_arguments,
     resolve_vesc_connection_from_args,
@@ -46,6 +46,13 @@ DEFAULT_SPECTRUM_REFRESH_HZ = 2.0
 DEFAULT_STATUS_REFRESH_HZ = 4.0
 DEFAULT_THEME = "light"
 QT_XCB_RUNTIME_LIBS = ("libxcb-cursor.so.0", "libxcb-icccm.so.4")
+IMU_POLL_RATE_OPTIONS_HZ = (1666, 833, 417)
+IMU_POLL_RATE_CONFIG_KEY = "imu_conf.sample_rate_hz"
+IMU_POLL_RATE_WRITE_SETTLE_S = 0.35
+IMU_STREAMER_STARTUP_TIMEOUT_S = 0.6
+IMU_STREAMER_RESTART_ATTEMPTS = 3
+IMU_STREAMER_RESTART_DELAY_S = 0.25
+IMU_STREAMER_START_ACK_TIMEOUT_S = 2.0
 
 ACC_X_INDEX = 0
 ACC_Y_INDEX = 1
@@ -243,6 +250,115 @@ def _actual_refresh_hz(refresh_timestamp_hist: deque[float]) -> float | None:
     return (len(refresh_timestamp_hist) - 1) / elapsed
 
 
+def _require_supported_imu_poll_rate_hz(poll_rate_hz: int) -> int:
+    rate = int(poll_rate_hz)
+    if rate not in IMU_POLL_RATE_OPTIONS_HZ:
+        supported = ", ".join(str(value) for value in IMU_POLL_RATE_OPTIONS_HZ)
+        raise ValueError(f"unsupported IMU poll rate {rate}; expected one of: {supported}")
+    return rate
+
+
+def _normalize_imu_poll_rate_hz(poll_rate_hz: int | None) -> int | None:
+    if poll_rate_hz is None:
+        return None
+    rate = int(poll_rate_hz)
+    if rate == 416:
+        return 417
+    return rate
+
+
+def read_imu_poll_rate_hz(
+    connection: VescConnection,
+    *,
+    timeout: float,
+) -> int | None:
+    client = connect_client(connection, timeout=timeout)
+    try:
+        config = client.get_appconf()
+    finally:
+        client.close()
+
+    raw_rate = config.get(IMU_POLL_RATE_CONFIG_KEY)
+    if raw_rate is None:
+        return None
+    return _normalize_imu_poll_rate_hz(int(raw_rate))
+
+
+def write_imu_poll_rate_hz(
+    connection: VescConnection,
+    *,
+    timeout: float,
+    poll_rate_hz: int,
+) -> int:
+    rate = _require_supported_imu_poll_rate_hz(poll_rate_hz)
+    client = connect_client(connection, timeout=timeout)
+    try:
+        config = client.get_appconf()
+        if IMU_POLL_RATE_CONFIG_KEY not in config:
+            raise KeyError(f"app config does not define {IMU_POLL_RATE_CONFIG_KEY}")
+        config[IMU_POLL_RATE_CONFIG_KEY] = rate
+        client.set_appconf(config, store=True, wait_ack=False)
+    finally:
+        client.close()
+    return rate
+
+
+def wait_for_streamer_startup(
+    streamer: VescImuStreamer,
+    *,
+    timeout_s: float,
+    process_events: Callable[[], None] | None = None,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        stats = streamer.source_stats()
+        if stats.done:
+            if stats.last_error is not None:
+                raise RuntimeError(stats.last_error)
+            raise RuntimeError("IMU streamer stopped during startup")
+
+        now = time.monotonic()
+        if now >= deadline:
+            return
+
+        if process_events is not None:
+            process_events()
+        time.sleep(min(0.02, deadline - now))
+
+
+def restart_streamer_with_retry(
+    streamer: VescImuStreamer,
+    *,
+    process_events: Callable[[], None] | None = None,
+    startup_timeout_s: float = IMU_STREAMER_STARTUP_TIMEOUT_S,
+    attempts: int = IMU_STREAMER_RESTART_ATTEMPTS,
+    retry_delay_s: float = IMU_STREAMER_RESTART_DELAY_S,
+) -> None:
+    if attempts <= 0:
+        raise ValueError("attempts must be greater than 0")
+
+    last_error: str | None = None
+    for attempt in range(1, attempts + 1):
+        streamer.start()
+        try:
+            wait_for_streamer_startup(
+                streamer,
+                timeout_s=startup_timeout_s,
+                process_events=process_events,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - aggregated for UI status.
+            last_error = str(exc)
+            streamer.stop(timeout=DEFAULT_TIMEOUT + 0.2)
+            if attempt == attempts:
+                break
+            if process_events is not None:
+                process_events()
+            time.sleep(retry_delay_s)
+
+    raise RuntimeError(last_error or "failed to restart IMU streamer")
+
+
 def run_live_plot(
     streamer: VescImuStreamer,
     *,
@@ -252,6 +368,8 @@ def run_live_plot(
     spectrum_refresh_hz: float = DEFAULT_SPECTRUM_REFRESH_HZ,
     antialias: bool = False,
     theme: str = DEFAULT_THEME,
+    initial_imu_poll_rate_hz: int | None = None,
+    apply_imu_poll_rate_hz: Callable[[int], int] | None = None,
 ) -> None:
     """Run a PyQtGraph live plot of package-streamed accel and gyro data."""
     selected_theme = PLOT_THEMES[theme]
@@ -285,18 +403,62 @@ def run_live_plot(
     )
     status = QtWidgets.QLabel("Waiting for package stream data...")
     status.setStyleSheet(f"color: {selected_theme.status_color};")
+    control_status = QtWidgets.QLabel("")
+    control_status.setStyleSheet(f"color: {selected_theme.status_color};")
 
     layout = QtWidgets.QGridLayout(window)
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(8)
     layout.addWidget(title, 0, 0, 1, column_count)
-    layout.addWidget(status, 3, 0, 1, column_count)
-    for plot_row in (1, 2):
+    layout.addWidget(control_status, 2, 0, 1, column_count)
+    layout.addWidget(status, 5, 0, 1, column_count)
+    for plot_row in (3, 4):
         layout.setRowStretch(plot_row, 1)
     for plot_col in range(column_count):
         layout.setColumnStretch(plot_col, 1)
     window.setStyleSheet(f"background-color: {selected_theme.window_background};")
     qt_size_policy = getattr(QtWidgets.QSizePolicy, "Policy", QtWidgets.QSizePolicy)
+
+    controls = QtWidgets.QWidget()
+    controls_layout = QtWidgets.QHBoxLayout(controls)
+    controls_layout.setContentsMargins(12, 0, 12, 0)
+    controls_layout.setSpacing(12)
+    controls_label = QtWidgets.QLabel("IMU poll rate")
+    controls_label.setStyleSheet(f"color: {selected_theme.title_color}; font-weight: 600;")
+    controls_layout.addWidget(controls_label)
+    controls_layout.addStretch(1)
+    layout.addWidget(controls, 1, 0, 1, column_count)
+
+    rate_buttons: dict[int, Any] = {}
+    current_imu_poll_rate_hz = _normalize_imu_poll_rate_hz(initial_imu_poll_rate_hz)
+
+    def _set_control_status(message: str) -> None:
+        control_status.setText(message)
+
+    def _refresh_control_status(prefix: str | None = None) -> None:
+        if current_imu_poll_rate_hz is None:
+            message = "IMU app config rate: unavailable"
+        elif current_imu_poll_rate_hz in IMU_POLL_RATE_OPTIONS_HZ:
+            message = f"IMU app config rate: {current_imu_poll_rate_hz} Hz"
+        else:
+            message = (
+                f"IMU app config rate: {current_imu_poll_rate_hz} Hz "
+                "(select 1666, 833, or 417 to change)"
+            )
+        if prefix is not None:
+            message = f"{prefix} | {message}"
+        _set_control_status(message)
+
+    def _set_rate_controls_enabled(enabled: bool) -> None:
+        for button in rate_buttons.values():
+            button.setEnabled(enabled)
+
+    for poll_rate_hz in IMU_POLL_RATE_OPTIONS_HZ:
+        button = QtWidgets.QPushButton(f"{poll_rate_hz} Hz")
+        rate_buttons[poll_rate_hz] = button
+        controls_layout.addWidget(button)
+
+    _refresh_control_status()
 
     def _make_plot(
         row: int,
@@ -339,10 +501,10 @@ def run_live_plot(
             lines.append(line)
         return tuple(lines)
 
-    ax_acc = _make_plot(1, 0, "Raw Accel Data", "Accel", x_label="Samples")
+    ax_acc = _make_plot(3, 0, "Raw Accel Data", "Accel", x_label="Samples")
     line_ax, line_ay, line_az = _add_lines(ax_acc, ("Acc X", "Acc Y", "Acc Z"))
 
-    ax_gyro = _make_plot(2, 0, "Raw Gyro Data", "Gyro", x_label="Samples")
+    ax_gyro = _make_plot(4, 0, "Raw Gyro Data", "Gyro", x_label="Samples")
     line_gx, line_gy, line_gz = _add_lines(ax_gyro, ("Gyro X", "Gyro Y", "Gyro Z"))
 
     acc_freq_lines: tuple[Any, Any, Any] | None = None
@@ -353,7 +515,7 @@ def run_live_plot(
 
     if show_freq:
         ax_acc_freq = _make_plot(
-            1,
+            3,
             1,
             "Raw Accel Frequency Analysis",
             "Magnitude",
@@ -362,7 +524,7 @@ def run_live_plot(
         acc_freq_lines = _add_lines(ax_acc_freq, ("Acc X", "Acc Y", "Acc Z"))
 
         ax_gyro_freq = _make_plot(
-            2,
+            4,
             1,
             "Raw Gyro Frequency Analysis",
             "Magnitude",
@@ -372,6 +534,17 @@ def run_live_plot(
 
     def _set_curve_data(line: Any, x_values: FloatArray, y_values: FloatArray) -> None:
         line.setData(x=x_values, y=y_values, connect="all", skipFiniteCheck=True)
+
+    def _clear_curves() -> None:
+        empty = np.empty(0, dtype=np.float64)
+        for line in (line_ax, line_ay, line_az, line_gx, line_gy, line_gz):
+            _set_curve_data(line, empty, empty)
+        if acc_freq_lines is not None:
+            for line in acc_freq_lines:
+                _set_curve_data(line, empty, empty)
+        if gyro_freq_lines is not None:
+            for line in gyro_freq_lines:
+                _set_curve_data(line, empty, empty)
 
     def _frequency_bins() -> tuple[int, FloatArray, FloatArray] | None:
         nonlocal frequency_window, frequency_window_count
@@ -535,6 +708,80 @@ def run_live_plot(
     status_timer.setInterval(round(1000.0 / DEFAULT_STATUS_REFRESH_HZ))
     status_timer.timeout.connect(refresh_status)
 
+    def _apply_selected_imu_poll_rate(selected_rate: int) -> None:
+        nonlocal current_imu_poll_rate_hz
+        nonlocal frequency_window
+        nonlocal frequency_window_count
+        nonlocal imu_history
+        nonlocal next_spectrum_update
+
+        if apply_imu_poll_rate_hz is None:
+            return
+
+        if selected_rate == current_imu_poll_rate_hz:
+            _refresh_control_status()
+            return
+
+        plot_timer.stop()
+        status_timer.stop()
+        _set_rate_controls_enabled(False)
+        _set_control_status(f"Writing IMU app config: {selected_rate} Hz...")
+        process_events = getattr(QtWidgets.QApplication, "processEvents", None)
+        if callable(process_events):
+            process_events()
+
+        error_message: str | None = None
+        try:
+            streamer.stop(timeout=DEFAULT_TIMEOUT + 0.2)
+            applied_rate = apply_imu_poll_rate_hz(selected_rate)
+            if callable(process_events):
+                process_events()
+            time.sleep(IMU_POLL_RATE_WRITE_SETTLE_S)
+            current_imu_poll_rate_hz = applied_rate
+            imu_history = ImuStreamerHistory(history)
+            refresh_timestamp_hist.clear()
+            frequency_window = np.empty(0, dtype=np.float64)
+            frequency_window_count = 0
+            next_spectrum_update = 0.0
+            acc_freq_range.x_max = 0.0
+            acc_freq_range.y_max = 0.0
+            gyro_freq_range.x_max = 0.0
+            gyro_freq_range.y_max = 0.0
+            _clear_curves()
+            restart_streamer_with_retry(
+                streamer,
+                process_events=process_events if callable(process_events) else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced in the control status.
+            error_message = str(exc)
+        finally:
+            if error_message is not None:
+                try:
+                    restart_streamer_with_retry(
+                        streamer,
+                        process_events=process_events if callable(process_events) else None,
+                    )
+                except Exception:
+                    pass
+
+            _set_rate_controls_enabled(True)
+            if error_message is None:
+                _refresh_control_status("Saved")
+            else:
+                _refresh_control_status(f"Write failed: {error_message}")
+            refresh_status()
+            plot_timer.start()
+            status_timer.start()
+
+    def _make_rate_click_handler(poll_rate_hz: int) -> Callable[[bool], None]:
+        def handler(_checked: bool = False) -> None:
+            _apply_selected_imu_poll_rate(poll_rate_hz)
+
+        return handler
+
+    for poll_rate_hz, button in rate_buttons.items():
+        button.clicked.connect(_make_rate_click_handler(poll_rate_hz))
+
     def stop_updates(*_args: object) -> None:
         plot_timer.stop()
         status_timer.stop()
@@ -646,9 +893,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     streamer = VescImuStreamer(
         connection=connection,
         timeout=args.timeout,
+        start_timeout=max(args.timeout, IMU_STREAMER_START_ACK_TIMEOUT_S),
         pending_samples=args.pending_samples,
         read_chunk_size=args.read_chunk_size,
     )
+    initial_imu_poll_rate_hz: int | None = None
+    try:
+        initial_imu_poll_rate_hz = read_imu_poll_rate_hz(connection, timeout=args.timeout)
+    except Exception as exc:  # noqa: BLE001 - surfaced in the UI and stderr.
+        print(f"Warning: could not read IMU app config rate: {exc}", file=sys.stderr)
+
     link_label = (
         f"BLE {connection.address}"
         if connection.kind is VescConnectionKind.BLE
@@ -671,6 +925,12 @@ def main(argv: Sequence[str] | None = None) -> None:
             spectrum_refresh_hz=args.spectrum_refresh_rate,
             antialias=args.antialias,
             theme=args.theme,
+            initial_imu_poll_rate_hz=initial_imu_poll_rate_hz,
+            apply_imu_poll_rate_hz=lambda poll_rate_hz: write_imu_poll_rate_hz(
+                connection,
+                timeout=args.timeout,
+                poll_rate_hz=poll_rate_hz,
+            ),
         )
     except KeyboardInterrupt:
         print("\nStopped.", file=sys.stderr)

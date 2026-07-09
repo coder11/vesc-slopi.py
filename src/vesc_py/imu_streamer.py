@@ -22,6 +22,7 @@ from vesc_py.live_signal import NSEC_PER_SEC
 from vesc_py.packet import PacketDecoder, encode_packet
 
 DEFAULT_TIMEOUT = 0.1
+DEFAULT_START_TIMEOUT = 0.5
 DEFAULT_PENDING_SAMPLES = 8192
 DEFAULT_READ_CHUNK_SIZE = 4096
 DEFAULT_FLUSH_SAMPLES = 128
@@ -458,6 +459,7 @@ class VescImuStreamer:
         *,
         connection: VescConnection,
         timeout: float = DEFAULT_TIMEOUT,
+        start_timeout: float | None = None,
         pending_samples: int = DEFAULT_PENDING_SAMPLES,
         read_chunk_size: int = DEFAULT_READ_CHUNK_SIZE,
         flush_samples: int = DEFAULT_FLUSH_SAMPLES,
@@ -465,6 +467,8 @@ class VescImuStreamer:
     ) -> None:
         if timeout <= 0.0:
             raise ValueError("timeout must be greater than 0")
+        if start_timeout is not None and start_timeout <= 0.0:
+            raise ValueError("start_timeout must be greater than 0")
         if read_chunk_size <= 0:
             raise ValueError("read_chunk_size must be greater than 0")
         if flush_samples <= 0:
@@ -474,6 +478,7 @@ class VescImuStreamer:
 
         self._connection = connection
         self._timeout = timeout
+        self._start_timeout = timeout if start_timeout is None else start_timeout
         self._read_chunk_size = read_chunk_size
         self._flush_samples = flush_samples
         self._flush_interval_ns = round(flush_interval_s * NSEC_PER_SEC)
@@ -596,8 +601,10 @@ class VescImuStreamer:
         decoder: PacketDecoder,
         command: int,
         queued_messages: list[ImuStreamerMessage],
+        *,
+        timeout_s: float,
     ) -> ImuStreamerAck | None:
-        deadline_ns = time.perf_counter_ns() + round(self._timeout * NSEC_PER_SEC)
+        deadline_ns = time.perf_counter_ns() + round(timeout_s * NSEC_PER_SEC)
         while not self._stop.is_set():
             remaining_ns = deadline_ns - time.perf_counter_ns()
             if remaining_ns <= 0:
@@ -682,6 +689,7 @@ class VescImuStreamer:
                 decoder,
                 IMU_STREAMER_CMD_START,
                 queued_messages,
+                timeout_s=self._start_timeout,
             )
             if ack is None:
                 self._stats.timeouts += 1

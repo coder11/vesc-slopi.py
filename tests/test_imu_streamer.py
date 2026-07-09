@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+import time
 
 import pytest
 
@@ -207,3 +208,67 @@ def test_vesc_imu_streamer_reads_samples_in_chunks_and_tracks_sequence_gaps(
     assert fake_serial.writes[0] == build_imu_streamer_command(IMU_STREAMER_CMD_START)
     assert fake_serial.writes[-1] == build_imu_streamer_command(IMU_STREAMER_CMD_STOP)
     assert fake_serial.closed is True
+
+
+def test_vesc_imu_streamer_waits_past_read_timeout_for_start_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ack = bytes(
+        [
+            CommPacketId.COMM_CUSTOM_APP_DATA,
+            IMU_STREAMER_MSG_ACK,
+            IMU_STREAMER_PROTOCOL_VERSION,
+            IMU_STREAMER_CMD_START,
+            IMU_STREAMER_ACK_OK,
+        ]
+    )
+
+    class FakeSerial:
+        timeout: float | None = None
+
+        def __init__(self) -> None:
+            self._read_calls = 0
+            self.writes: list[bytes] = []
+            self.closed = False
+
+        def read(self, size: int = 1) -> bytes:
+            self._read_calls += 1
+            if self._read_calls < 3:
+                time.sleep(0.015)
+                return b""
+            source._stop.set()
+            return encode_packet(ack)
+
+        def write(self, data: bytes) -> int:
+            self.writes.append(data)
+            return len(data)
+
+        def reset_input_buffer(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    fake_serial = FakeSerial()
+    source = VescImuStreamer(
+        connection=VescConnection.serial("/dev/null"),
+        timeout=0.01,
+        start_timeout=0.05,
+        pending_samples=8,
+        read_chunk_size=4096,
+        flush_samples=8,
+    )
+
+    def fake_open_blocking_io(connection: VescConnection, *, timeout: float) -> FakeSerial:
+        assert connection == VescConnection.serial("/dev/null")
+        assert timeout == pytest.approx(0.01)
+        return fake_serial
+
+    monkeypatch.setattr("vesc_py.imu_streamer.open_blocking_io", fake_open_blocking_io)
+
+    source._run()
+
+    stats = source.source_stats()
+    assert stats.last_error is None
+    assert stats.timeouts == 0
+    assert fake_serial.writes[0] == build_imu_streamer_command(IMU_STREAMER_CMD_START)
